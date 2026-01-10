@@ -24,55 +24,110 @@ pub const Hooks = struct {
     }
 };
 
-pub fn Cpu(comptime hooks: Hooks) type {
+pub const Config = struct {
+    /// Enable Physical Memory Protection checks.
+    /// Disable for ~2-3x speedup when running trusted code.
+    enable_pmp: bool = true,
+
+    /// Enable memory alignment checks for loads/stores.
+    /// RISC-V spec requires this, disable only for known-aligned code.
+    enable_memory_alignment: bool = true,
+
+    /// Enable privilege level enforcement.
+    /// When disabled, all code runs in effective_privilege mode.
+    enable_privilege: bool = true,
+
+    /// Enable CSR privilege and read-only checks.
+    enable_csr_checks: bool = true,
+
+    /// Privilege level when enable_privilege=false
+    effective_privilege: arch.PrivilegeLevel = .machine,
+
+    /// Enable interrupt checking each step.
+    /// Disable if using polling-based interrupt model.
+    enable_interrupts: bool = true,
+
+    /// Enable branch/jump target alignment checks (4-byte for RV32I).
+    enable_branch_alignment: bool = true,
+
+    /// Enable floating-point extensions (F/D).
+    enable_fpu: bool = true,
+
+    /// Enable FPU exception flags (NV, DZ, OF, UF, NX).
+    /// When disabled, FCSR flags are not updated.
+    enable_fpu_flags: bool = true,
+
+    /// Enable cycle/instret counter updates.
+    enable_counters: bool = true,
+
+    /// Enable M extension (multiply/divide)
+    enable_m_ext: bool = true,
+
+    /// Enable Zba extension (address generation)
+    enable_zba_ext: bool = true,
+
+    /// Enable Zbb extension (bit manipulation)
+    enable_zbb_ext: bool = true,
+
+    /// Maximum performance, minimal checks (for trusted code)
+    pub const fast = Config{
+        .enable_pmp = false,
+        .enable_memory_alignment = false,
+        .enable_privilege = false,
+        .enable_csr_checks = false,
+        .enable_interrupts = false,
+        .enable_branch_alignment = false,
+        .enable_fpu_flags = false,
+        .enable_counters = false,
+    };
+
+    /// Full spec compliance (default)
+    pub const compliant = Config{};
+
+    /// Embedded system (no FPU, with protection)
+    pub const embedded = Config{
+        .enable_fpu = false,
+        .enable_fpu_flags = false,
+    };
+
+    /// User-mode sandbox (full protection, no M-mode features)
+    pub const sandbox = Config{
+        .effective_privilege = .user,
+    };
+};
+
+pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
     return struct {
         const Self = @This();
 
-        const MemoryError = error{ AddressOutOfBounds, MisalignedAddress };
+        const MemoryError = error{ AddressOutOfBounds, MisalignedAddress, PmpViolation };
         const FetchError = MemoryError || arch.Instruction.DecodeError;
 
         const ErrorCause = enum { instruction, load, store };
 
         pub const ElfLoadError = error{OutOfRam} || elf.ParseError;
 
-        pub const Exception = struct {
-            pub const Kind = enum(u8) {
-                instr_address_misaligned = 0,
-                instr_access_fault = 1,
-                illegal_instruction = 2,
-                breakpoint = 3,
-                load_address_misaligned = 4,
-                load_access_fault = 5,
-                store_address_misaligned = 6,
-                store_access_fault = 7,
-                ecall_from_u = 8,
-                // Not used for now:
-                // ecall_from_s = 9,
-                // ecall_from_m = 11,
-                // instr_page_fault = 12,
-                // load_page_fault = 13,
-                // store_page_fault = 15,
-            };
+        pub const TrapCause = union(enum) {
+            exception: arch.Registers.Mcause.Exception,
+            interrupt: arch.Registers.Mcause.Interrupt,
 
-            kind: Kind,
-            cpu: *Self,
-
-            pub inline fn fromKind(kind: Kind, cpu: *Self) Exception {
-                return .{
-                    .kind = kind,
-                    .cpu = cpu,
+            pub inline fn toMcause(this: TrapCause) arch.Registers.Mcause {
+                return switch (this) {
+                    .exception => |e| arch.Registers.Mcause.fromException(e),
+                    .interrupt => |i| arch.Registers.Mcause.fromInterrupt(i),
                 };
-            }
-
-            pub inline fn resolveAndSkip(this: *Exception) void {
-                this.cpu.registers.pc +%= 4;
-                this.cpu.incCounters(false);
             }
         };
 
         pub const State = union(enum) {
             ok,
-            exception: Exception,
+            trap: TrapInfo,
+            halt, // WFI with no pending interrupts
+
+            pub const TrapInfo = struct {
+                cause: TrapCause,
+                tval: u32,
+            };
         };
 
         ram: []u8,
@@ -87,6 +142,15 @@ pub fn Cpu(comptime hooks: Hooks) type {
         }
 
         pub inline fn step(this: *Self) State {
+            if (comptime config.enable_interrupts) {
+                if (this.checkInterrupts()) |int_cause| {
+                    this.handleTrap(.{ .interrupt = int_cause }, 0);
+                    this.incCounters(false);
+
+                    return .ok;
+                }
+            }
+
             const instr = this.fetch() catch |err| {
                 return this.fetchErrorToState(err);
             };
@@ -106,7 +170,19 @@ pub fn Cpu(comptime hooks: Hooks) type {
             return .ok;
         }
 
-        pub fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8) ElfLoadError!void {
+        inline fn getPrivilege(self: *Self) arch.PrivilegeLevel {
+            if (comptime config.enable_privilege) {
+                return self.registers.privilege.sanitize();
+            } else {
+                return config.effective_privilege;
+            }
+        }
+
+        inline fn trapState(exception: arch.Registers.Mcause.Exception, tval: u32) State {
+            return .{ .trap = .{ .cause = .{ .exception = exception }, .tval = tval } };
+        }
+
+        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8) ElfLoadError!void {
             var reader: std.Io.Reader = .fixed(content);
 
             var file = try elf.File.parse(allocator, &reader);
@@ -147,15 +223,23 @@ pub fn Cpu(comptime hooks: Hooks) type {
             this.registers.pc = file.header.entry;
         }
 
-        pub inline fn readMemory(this: *Self, address: u32, comptime T: type) MemoryError!T {
+        pub inline fn readMemory(this: *Self, address: u32, comptime T: type, comptime access: arch.Registers.Pmp.AccessType) MemoryError!T {
             const byte_len = @sizeOf(T);
+
+            if (comptime config.enable_pmp) {
+                if (!this.registers.checkPmpAccess(address, access)) {
+                    return MemoryError.PmpViolation;
+                }
+            }
 
             if (address + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
             }
 
-            if (address % byte_len != 0) {
-                return MemoryError.MisalignedAddress;
+            if (comptime config.enable_memory_alignment) {
+                if (address % byte_len != 0) {
+                    return MemoryError.MisalignedAddress;
+                }
             }
 
             const result: T = std.mem.bytesToValue(T, this.ram[address .. address + byte_len]);
@@ -167,65 +251,141 @@ pub fn Cpu(comptime hooks: Hooks) type {
             const T = @TypeOf(value);
             const byte_len = @sizeOf(T);
 
+            if (comptime config.enable_pmp) {
+                if (!this.registers.checkPmpAccess(address, .write)) {
+                    return MemoryError.PmpViolation;
+                }
+            }
+
             if (address + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
             }
 
-            if (address % byte_len != 0) {
-                return MemoryError.MisalignedAddress;
+            if (comptime config.enable_memory_alignment) {
+                if (address % byte_len != 0) {
+                    return MemoryError.MisalignedAddress;
+                }
             }
 
             const bytes = std.mem.asBytes(&std.mem.nativeTo(T, value, arch.ENDIAN));
-
             @memcpy(this.ram[address .. address + byte_len], bytes);
         }
 
         inline fn fetch(this: *Self) FetchError!arch.Instruction {
-            std.debug.assert(this.registers.pc < this.ram.len);
-            std.debug.assert(this.registers.pc + @sizeOf(u32) <= this.ram.len);
+            const raw = try this.readMemory(this.registers.pc, u32, .execute);
 
-            return arch.Instruction.decode(try this.readMemory(this.registers.pc, u32));
+            return arch.Instruction.decode(raw);
         }
 
         inline fn incCounters(this: *Self, comptime is_retired: bool) void {
-            this.registers.cycle +%= 1;
+            if (comptime config.enable_counters) {
+                this.registers.cycle +%= 1;
 
-            if (is_retired) {
-                this.registers.instret +%= 1;
+                if (is_retired) {
+                    this.registers.instret +%= 1;
+                }
             }
         }
 
-        inline fn memoryErrorToException(err: MemoryError, cause: ErrorCause) Exception.Kind {
+        inline fn memoryErrorToException(err: MemoryError, cause: ErrorCause) arch.Registers.Mcause.Exception {
             return switch (cause) {
-                .instruction => return switch (err) {
-                    MemoryError.AddressOutOfBounds => .instr_access_fault,
-                    MemoryError.MisalignedAddress => .instr_address_misaligned,
+                .instruction => switch (err) {
+                    MemoryError.AddressOutOfBounds, MemoryError.PmpViolation => .instruction_access_fault,
+                    MemoryError.MisalignedAddress => .instruction_address_misaligned,
                 },
-                .load => return switch (err) {
-                    MemoryError.AddressOutOfBounds => .load_access_fault,
+                .load => switch (err) {
+                    MemoryError.AddressOutOfBounds, MemoryError.PmpViolation => .load_access_fault,
                     MemoryError.MisalignedAddress => .load_address_misaligned,
                 },
-                .store => return switch (err) {
-                    MemoryError.AddressOutOfBounds => .store_access_fault,
+                .store => switch (err) {
+                    MemoryError.AddressOutOfBounds, MemoryError.PmpViolation => .store_access_fault,
                     MemoryError.MisalignedAddress => .store_address_misaligned,
                 },
             };
         }
 
-        inline fn memoryErrorToState(this: *Self, err: MemoryError, cause: ErrorCause) State {
-            return .{ .exception = .fromKind(memoryErrorToException(err, cause), this) };
-        }
-
-        inline fn fetchErrorToException(err: FetchError) Exception.Kind {
-            return switch (err) {
-                FetchError.AddressOutOfBounds => return memoryErrorToException(MemoryError.AddressOutOfBounds, .instruction),
-                FetchError.MisalignedAddress => return memoryErrorToException(MemoryError.MisalignedAddress, .instruction),
-                FetchError.UnknownInstruction, FetchError.BadRegister => .illegal_instruction,
-            };
+        inline fn memoryErrorToState(err: MemoryError, cause: ErrorCause, addr: u32) State {
+            return trapState(memoryErrorToException(err, cause), addr);
         }
 
         inline fn fetchErrorToState(this: *Self, err: FetchError) State {
-            return .{ .exception = .fromKind(fetchErrorToException(err), this) };
+            const exception: arch.Registers.Mcause.Exception = switch (err) {
+                FetchError.AddressOutOfBounds, FetchError.PmpViolation => .instruction_access_fault,
+                FetchError.MisalignedAddress => .instruction_address_misaligned,
+                FetchError.UnknownInstruction, FetchError.BadRegister => .illegal_instruction,
+            };
+
+            return trapState(exception, this.registers.pc);
+        }
+
+        pub inline fn handleTrap(this: *Self, cause: TrapCause, tval: u32) void {
+            const mcause = cause.toMcause();
+            const is_interrupt = mcause.interrupt;
+
+            this.registers.mepc = this.registers.pc;
+            this.registers.mcause = mcause;
+            this.registers.mtval = tval;
+
+            this.registers.mstatus.mpie = this.registers.mstatus.mie;
+            this.registers.mstatus.mpp = this.registers.privilege.sanitize();
+            this.registers.mstatus.mie = false;
+
+            this.registers.privilege = .machine;
+
+            this.registers.pc = this.registers.mtvec.getAddress(mcause.code, is_interrupt);
+        }
+
+        inline fn executeMret(this: *Self) State {
+            if (comptime config.enable_privilege) {
+                // mret is only valid in M-mode
+                if (this.registers.privilege != .machine) {
+                    return trapState(.illegal_instruction, 0);
+                }
+            }
+
+            this.registers.privilege = this.registers.mstatus.mpp.sanitize();
+
+            this.registers.mstatus.mie = this.registers.mstatus.mpie;
+            this.registers.mstatus.mpie = true;
+
+            this.registers.mstatus.mpp = .user;
+
+            this.registers.pc = this.registers.mepc;
+
+            return .ok;
+        }
+
+        pub inline fn checkInterrupts(this: *Self) ?arch.Registers.Mcause.Interrupt {
+            if (comptime !config.enable_interrupts) {
+                return null;
+            }
+            
+            const priv = this.registers.privilege.sanitize();
+
+            const can_interrupt = this.registers.mstatus.mie or (priv == .user);
+
+            if (!can_interrupt) {
+                return null;
+            }
+
+            const mie: u32 = @bitCast(this.registers.mie);
+            const mip: u32 = @bitCast(this.registers.mip);
+            const pending = mie & mip;
+
+            // Priority: MEI > MSI > MTI
+            if (pending & 0x800 != 0) {
+                return .machine_external;
+            }
+
+            if (pending & 0x008 != 0) {
+                return .machine_software;
+            }
+
+            if (pending & 0x080 != 0) {
+                return .machine_timer;
+            }
+
+            return null;
         }
 
         inline fn execute(this: *Self, instruction: arch.Instruction) State {
@@ -244,12 +404,29 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 },
                 .jal => |i| {
                     const offset: u32 = @bitCast(@as(i32, i.imm));
+                    const target = this.registers.pc +% offset;
+
+                    if (comptime config.enable_branch_alignment) {
+                        if (target % 4 != 0) {
+                            this.incCounters(true);
+
+                            return trapState(.instruction_address_misaligned, target);
+                        }
+                    }
 
                     this.registers.set(i.rd, @bitCast(this.registers.pc +% 4));
-                    this.registers.pc +%= offset;
+                    this.registers.pc = target;
                 },
                 .jalr => |i| {
                     const target: u32 = @bitCast((this.registers.get(i.rs1) +% i.imm) & ~@as(i32, 1));
+
+                    if (comptime config.enable_branch_alignment) {
+                        if (target % 4 != 0) {
+                            this.incCounters(true);
+
+                            return trapState(.instruction_address_misaligned, target);
+                        }
+                    }
 
                     this.registers.set(i.rd, @bitCast(this.registers.pc +% 4));
                     this.registers.pc = target;
@@ -257,8 +434,17 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .beq => |i| {
                     if (this.registers.get(i.rs1) == this.registers.get(i.rs2)) {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
+                        const target = this.registers.pc +% offset;
 
-                        this.registers.pc +%= offset;
+                        if (comptime config.enable_branch_alignment) {
+                            if (target % 4 != 0) {
+                                this.incCounters(true);
+
+                                return trapState(.instruction_address_misaligned, target);
+                            }
+                        }
+
+                        this.registers.pc = target;
                     } else {
                         this.registers.pc +%= 4;
                     }
@@ -266,8 +452,17 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .bne => |i| {
                     if (this.registers.get(i.rs1) != this.registers.get(i.rs2)) {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
+                        const target = this.registers.pc +% offset;
 
-                        this.registers.pc +%= offset;
+                        if (comptime config.enable_branch_alignment) {
+                            if (target % 4 != 0) {
+                                this.incCounters(true);
+
+                                return trapState(.instruction_address_misaligned, target);
+                            }
+                        }
+
+                        this.registers.pc = target;
                     } else {
                         this.registers.pc +%= 4;
                     }
@@ -275,8 +470,17 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .blt => |i| {
                     if (this.registers.get(i.rs1) < this.registers.get(i.rs2)) {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
+                        const target = this.registers.pc +% offset;
 
-                        this.registers.pc +%= offset;
+                        if (comptime config.enable_branch_alignment) {
+                            if (target % 4 != 0) {
+                                this.incCounters(true);
+
+                                return trapState(.instruction_address_misaligned, target);
+                            }
+                        }
+
+                        this.registers.pc = target;
                     } else {
                         this.registers.pc +%= 4;
                     }
@@ -284,8 +488,17 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .bge => |i| {
                     if (this.registers.get(i.rs1) >= this.registers.get(i.rs2)) {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
+                        const target = this.registers.pc +% offset;
 
-                        this.registers.pc +%= offset;
+                        if (comptime config.enable_branch_alignment) {
+                            if (target % 4 != 0) {
+                                this.incCounters(true);
+
+                                return trapState(.instruction_address_misaligned, target);
+                            }
+                        }
+
+                        this.registers.pc = target;
                     } else {
                         this.registers.pc +%= 4;
                     }
@@ -296,8 +509,17 @@ pub fn Cpu(comptime hooks: Hooks) type {
 
                     if (rs1_u < rs2_u) {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
+                        const target = this.registers.pc +% offset;
 
-                        this.registers.pc +%= offset;
+                        if (comptime config.enable_branch_alignment) {
+                            if (target % 4 != 0) {
+                                this.incCounters(true);
+
+                                return trapState(.instruction_address_misaligned, target);
+                            }
+                        }
+
+                        this.registers.pc = target;
                     } else {
                         this.registers.pc +%= 4;
                     }
@@ -308,8 +530,17 @@ pub fn Cpu(comptime hooks: Hooks) type {
 
                     if (rs1_u >= rs2_u) {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
+                        const target = this.registers.pc +% offset;
 
-                        this.registers.pc +%= offset;
+                        if (comptime config.enable_branch_alignment) {
+                            if (target % 4 != 0) {
+                                this.incCounters(true);
+
+                                return trapState(.instruction_address_misaligned, target);
+                            }
+                        }
+
+                        this.registers.pc = target;
                     } else {
                         this.registers.pc +%= 4;
                     }
@@ -318,20 +549,23 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
+                    const val = this.readMemory(addr, i8, .read) catch |err| {
+                        this.incCounters(true);
 
-                    if (addr >= this.ram.len) {
-                        return .{ .exception = .fromKind(.load_access_fault, this) };
-                    }
+                        return memoryErrorToState(err, .load, addr);
+                    };
 
-                    const val: i8 = @bitCast(this.ram[addr]);
                     this.registers.set(i.rd, val);
                     this.registers.pc +%= 4;
                 },
                 .lh => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
-                    const val = this.readMemory(base +% offset, i16) catch |err| {
-                        return this.memoryErrorToState(err, .load);
+                    const addr = base +% offset;
+                    const val = this.readMemory(addr, i16, .read) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .load, addr);
                     };
 
                     this.registers.set(i.rd, val);
@@ -340,8 +574,11 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .lw => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
-                    const val = this.readMemory(base +% offset, i32) catch |err| {
-                        return this.memoryErrorToState(err, .load);
+                    const addr = base +% offset;
+                    const val = this.readMemory(addr, i32, .read) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .load, addr);
                     };
 
                     this.registers.set(i.rd, val);
@@ -351,19 +588,23 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
+                    const val = this.readMemory(addr, u8, .read) catch |err| {
+                        this.incCounters(true);
 
-                    if (addr >= this.ram.len) {
-                        return .{ .exception = .fromKind(.load_access_fault, this) };
-                    }
+                        return memoryErrorToState(err, .load, addr);
+                    };
 
-                    this.registers.set(i.rd, this.ram[addr]);
+                    this.registers.set(i.rd, val);
                     this.registers.pc +%= 4;
                 },
                 .lhu => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
-                    const val = this.readMemory(base +% offset, u16) catch |err| {
-                        return this.memoryErrorToState(err, .load);
+                    const addr = base +% offset;
+                    const val = this.readMemory(addr, u16, .read) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .load, addr);
                     };
 
                     this.registers.set(i.rd, val);
@@ -373,21 +614,26 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
+                    const val: u8 = @truncate(@as(u32, @bitCast(this.registers.get(i.rs2))));
 
-                    if (addr >= this.ram.len) {
-                        return .{ .exception = .fromKind(.store_access_fault, this) };
-                    }
+                    this.writeMemory(addr, val) catch |err| {
+                        this.incCounters(true);
 
-                    this.ram[addr] = @truncate(@as(u32, @bitCast(this.registers.get(i.rs2))));
+                        return memoryErrorToState(err, .store, addr);
+                    };
+
                     this.registers.pc +%= 4;
                 },
                 .sh => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
+                    const addr = base +% offset;
                     const val: u16 = @truncate(@as(u32, @bitCast(this.registers.get(i.rs2))));
 
-                    this.writeMemory(base +% offset, val) catch |err| {
-                        return this.memoryErrorToState(err, .store);
+                    this.writeMemory(addr, val) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .store, addr);
                     };
 
                     this.registers.pc +%= 4;
@@ -395,9 +641,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .sw => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
+                    const addr = base +% offset;
 
-                    this.writeMemory(base +% offset, @as(u32, @bitCast(this.registers.get(i.rs2)))) catch |err| {
-                        return this.memoryErrorToState(err, .store);
+                    this.writeMemory(addr, @as(u32, @bitCast(this.registers.get(i.rs2)))) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .store, addr);
                     };
 
                     this.registers.pc +%= 4;
@@ -504,24 +753,52 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .ecall => {
-                    if (hooks.ecall(this)) {
-                        this.registers.pc +%= 4;
-                    } else {
-                        return .{ .exception = .fromKind(.ecall_from_u, this) };
+                    const cause: arch.Registers.Mcause.Exception = if (comptime config.enable_privilege)
+                        switch (this.registers.privilege.sanitize()) {
+                            .user => .ecall_from_u,
+                            .machine => .ecall_from_m,
+                            _ => .ecall_from_m,
+                        }
+                    else switch (config.effective_privilege) {
+                        .user => .ecall_from_u,
+                        .machine => .ecall_from_m,
+                        _ => .ecall_from_m,
+                    };
+
+                    if (!hooks.ecall(@ptrCast(this))) {
+                        this.incCounters(true);
+
+                        return trapState(cause, 0);
                     }
+
+                    this.registers.pc +%= 4;
                 },
                 .ebreak => {
-                    if (hooks.ebreak(this)) {
-                        this.registers.pc +%= 4;
-                    } else {
-                        return .{ .exception = .fromKind(.breakpoint, this) };
+                    if (!hooks.ebreak(@ptrCast(this))) {
+                        this.incCounters(true);
+
+                        return trapState(.breakpoint, this.registers.pc); // breakpoint: mtval = PC
                     }
+
+                    this.registers.pc +%= 4;
                 },
                 .mul => |i| {
+                    if (comptime !config.enable_m_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     this.registers.set(i.rd, this.registers.get(i.rs1) *% this.registers.get(i.rs2));
                     this.registers.pc +%= 4;
                 },
                 .mulh => |i| {
+                    if (comptime !config.enable_m_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const rs1: i64 = this.registers.get(i.rs1);
                     const rs2: i64 = this.registers.get(i.rs2);
 
@@ -529,6 +806,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .mulhsu => |i| {
+                    if (comptime !config.enable_m_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const rs1_s: i64 = this.registers.get(i.rs1);
                     const rs2_u: u64 = @as(u32, @bitCast(this.registers.get(i.rs2)));
                     const val: i64 = rs1_s * @as(i64, @bitCast(rs2_u));
@@ -537,6 +820,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .mulhu => |i| {
+                    if (comptime !config.enable_m_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const rs1_u: u64 = @as(u32, @bitCast(this.registers.get(i.rs1)));
                     const rs2_u: u64 = @as(u32, @bitCast(this.registers.get(i.rs2)));
 
@@ -544,12 +833,18 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .div => |i| {
+                    if (comptime !config.enable_m_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const dividend = this.registers.get(i.rs1);
                     const divisor = this.registers.get(i.rs2);
                     const result: i32 = if (divisor == 0)
                         -1
                     else if (dividend == std.math.minInt(i32) and divisor == -1)
-                        dividend // overflow case
+                        dividend
                     else
                         @divTrunc(dividend, divisor);
 
@@ -557,6 +852,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .divu => |i| {
+                    if (comptime !config.enable_m_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const dividend_u: u32 = @bitCast(this.registers.get(i.rs1));
                     const divisor_u: u32 = @bitCast(this.registers.get(i.rs2));
 
@@ -569,13 +870,19 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .rem => |i| {
+                    if (comptime !config.enable_m_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const dividend = this.registers.get(i.rs1);
                     const divisor = this.registers.get(i.rs2);
 
                     const result: i32 = if (divisor == 0)
                         dividend
                     else if (dividend == std.math.minInt(i32) and divisor == -1)
-                        0 // overflow case
+                        0
                     else
                         @rem(dividend, divisor);
 
@@ -583,6 +890,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .remu => |i| {
+                    if (comptime !config.enable_m_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const dividend_u: u32 = @bitCast(this.registers.get(i.rs1));
                     const divisor_u: u32 = @bitCast(this.registers.get(i.rs2));
 
@@ -597,8 +910,11 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .flw => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
-                    const val = this.readMemory(base +% offset, u32) catch |err| {
-                        return this.memoryErrorToState(err, .load);
+                    const addr = base +% offset;
+                    const val = this.readMemory(addr, u32, .read) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .load, addr);
                     };
 
                     this.registers.setF32(i.rd, @bitCast(val));
@@ -607,10 +923,13 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .fsw => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
+                    const addr = base +% offset;
                     const val: u32 = @bitCast(this.registers.getF32(i.rs2));
 
-                    this.writeMemory(base +% offset, val) catch |err| {
-                        return this.memoryErrorToState(err, .store);
+                    this.writeMemory(addr, val) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .store, addr);
                     };
 
                     this.registers.pc +%= 4;
@@ -619,39 +938,43 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
-
-                    if (std.math.isInf(rs1) and std.math.isInf(rs2)) {
-                        if ((rs1 > 0) == (rs2 < 0)) {
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2))
+                        {
                             this.registers.fcsr.nv = true;
-                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
+                        }
 
-                            return .ok;
+                        if (std.math.isInf(rs1) and std.math.isInf(rs2)) {
+                            if ((rs1 > 0) == (rs2 < 0)) {
+                                this.registers.fcsr.nv = true;
+                                this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                                this.registers.pc +%= 4;
+                                this.incCounters(true);
+
+                                return .ok;
+                            }
                         }
                     }
 
                     const result = rs1 + rs2;
 
-                    if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
-                        this.registers.fcsr.of = true;
-                        this.registers.fcsr.nx = true;
-                    }
-
-                    if (arch.FloatHelpers.isSubnormalF32(result)) {
-                        this.registers.fcsr.uf = true;
-                    }
-
-                    if (!std.math.isNan(result) and !std.math.isInf(result)) {
-                        const check: f64 = @as(f64, rs1) + @as(f64, rs2);
-
-                        if (@as(f64, result) != check) {
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
+                            this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
+                        }
+
+                        if (arch.FloatHelpers.isSubnormalF32(result)) {
+                            this.registers.fcsr.uf = true;
+                        }
+
+                        if (!std.math.isNan(result) and !std.math.isInf(result)) {
+                            const check: f64 = @as(f64, rs1) + @as(f64, rs2);
+
+                            if (@as(f64, result) != check) {
+                                this.registers.fcsr.nx = true;
+                            }
                         }
                     }
 
@@ -662,37 +985,41 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if (std.math.isInf(rs1) and std.math.isInf(rs2) and (rs1 > 0) == (rs2 > 0)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if (std.math.isInf(rs1) and std.math.isInf(rs2) and (rs1 > 0) == (rs2 > 0)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = rs1 - rs2;
 
-                    if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
-                        this.registers.fcsr.of = true;
-                        this.registers.fcsr.nx = true;
-                    }
-
-                    if (arch.FloatHelpers.isSubnormalF32(result)) {
-                        this.registers.fcsr.uf = true;
-                    }
-
-                    if (!std.math.isNan(result) and !std.math.isInf(result)) {
-                        const check: f64 = @as(f64, rs1) - @as(f64, rs2);
-
-                        if (@as(f64, result) != check) {
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
+                            this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
+                        }
+
+                        if (arch.FloatHelpers.isSubnormalF32(result)) {
+                            this.registers.fcsr.uf = true;
+                        }
+
+                        if (!std.math.isNan(result) and !std.math.isInf(result)) {
+                            const check: f64 = @as(f64, rs1) - @as(f64, rs2);
+
+                            if (@as(f64, result) != check) {
+                                this.registers.fcsr.nx = true;
+                            }
                         }
                     }
 
@@ -703,41 +1030,45 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((rs1 == 0 and std.math.isInf(rs2)) or (std.math.isInf(rs1) and rs2 == 0)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((rs1 == 0 and std.math.isInf(rs2)) or (std.math.isInf(rs1) and rs2 == 0)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = rs1 * rs2;
 
-                    if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
-                        this.registers.fcsr.of = true;
-                        this.registers.fcsr.nx = true;
-                    }
-
-                    if (arch.FloatHelpers.isSubnormalF32(result)) {
-                        this.registers.fcsr.uf = true;
-                    }
-
-                    if (!std.math.isNan(result) and
-                        !std.math.isInf(result) and
-                        !std.math.isInf(rs1) and
-                        !std.math.isInf(rs2))
-                    {
-                        const check: f64 = @as(f64, rs1) * @as(f64, rs2);
-
-                        if (@as(f64, result) != check) {
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
+                            this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
+                        }
+
+                        if (arch.FloatHelpers.isSubnormalF32(result)) {
+                            this.registers.fcsr.uf = true;
+                        }
+
+                        if (!std.math.isNan(result) and
+                            !std.math.isInf(result) and
+                            !std.math.isInf(rs1) and
+                            !std.math.isInf(rs2))
+                        {
+                            const check: f64 = @as(f64, rs1) * @as(f64, rs2);
+
+                            if (@as(f64, result) != check) {
+                                this.registers.fcsr.nx = true;
+                            }
                         }
                     }
 
@@ -748,41 +1079,45 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((rs1 == 0 and rs2 == 0) or (std.math.isInf(rs1) and std.math.isInf(rs2))) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((rs1 == 0 and rs2 == 0) or (std.math.isInf(rs1) and std.math.isInf(rs2))) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
-                    }
+                            return .ok;
+                        }
 
-                    if (rs2 == 0 and rs1 != 0 and !std.math.isNan(rs1)) {
-                        this.registers.fcsr.dz = true;
+                        if (rs2 == 0 and rs1 != 0 and !std.math.isNan(rs1)) {
+                            this.registers.fcsr.dz = true;
+                        }
                     }
 
                     const result = rs1 / rs2;
 
-                    if (std.math.isInf(result) and !std.math.isInf(rs1) and rs2 != 0) {
-                        this.registers.fcsr.of = true;
-                        this.registers.fcsr.nx = true;
-                    }
-
-                    if (arch.FloatHelpers.isSubnormalF32(result)) {
-                        this.registers.fcsr.uf = true;
-                    }
-
-                    if (!std.math.isNan(result) and !std.math.isInf(result) and rs2 != 0) {
-                        const check: f64 = @as(f64, rs1) / @as(f64, rs2);
-
-                        if (@as(f64, result) != check) {
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isInf(result) and !std.math.isInf(rs1) and rs2 != 0) {
+                            this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
+                        }
+
+                        if (arch.FloatHelpers.isSubnormalF32(result)) {
+                            this.registers.fcsr.uf = true;
+                        }
+
+                        if (!std.math.isNan(result) and !std.math.isInf(result) and rs2 != 0) {
+                            const check: f64 = @as(f64, rs1) / @as(f64, rs2);
+
+                            if (@as(f64, result) != check) {
+                                this.registers.fcsr.nx = true;
+                            }
                         }
                     }
 
@@ -792,17 +1127,19 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .fsqrt_s => |i| {
                     const rs1 = this.registers.getF32(i.rs1);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1)) {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1)) {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if (rs1 < 0 and !arch.FloatHelpers.isNegativeZeroF32(rs1)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if (rs1 < 0 and !arch.FloatHelpers.isNegativeZeroF32(rs1)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @sqrt(rs1);
@@ -819,10 +1156,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     const result: f32 = if (std.math.isNan(rs1) and std.math.isNan(rs2))
@@ -847,10 +1186,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     const result: f32 = if (std.math.isNan(rs1) and std.math.isNan(rs2))
@@ -899,10 +1240,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     const result: i32 = if (std.math.isNan(rs1) or std.math.isNan(rs2))
@@ -919,13 +1262,15 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.set(i.rd, 0);
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.set(i.rd, 0);
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     this.registers.set(i.rd, if (rs1 < rs2) 1 else 0);
@@ -935,13 +1280,15 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.set(i.rd, 0);
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.set(i.rd, 0);
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     this.registers.set(i.rd, if (rs1 <= rs2) 1 else 0);
@@ -952,41 +1299,44 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rm = this.registers.fcsr.getEffectiveRm(i.rm);
 
                     var result: i32 = undefined;
-                    var invalid = false;
 
-                    if (std.math.isNan(rs1)) {
-                        result = std.math.maxInt(i32);
-                        invalid = true;
-                    } else if (std.math.isInf(rs1)) {
-                        result = if (rs1 > 0) std.math.maxInt(i32) else std.math.minInt(i32);
-                        invalid = true;
-                    } else {
-                        const rounded: f32 = switch (rm) {
-                            .rne => arch.FloatHelpers.roundToNearestEvenF32(rs1),
-                            .rtz => if (rs1 >= 0) @floor(rs1) else @ceil(rs1),
-                            .rdn => @floor(rs1),
-                            .rup => @ceil(rs1),
-                            .rmm => if (rs1 >= 0) @floor(rs1 + 0.5) else @ceil(rs1 - 0.5),
-                            else => arch.FloatHelpers.roundToNearestEvenF32(rs1),
-                        };
+                    if (comptime config.enable_fpu_flags) {
+                        var invalid = false;
 
-                        if (rounded > @as(f32, @floatFromInt(std.math.maxInt(i32)))) {
+                        if (std.math.isNan(rs1)) {
                             result = std.math.maxInt(i32);
                             invalid = true;
-                        } else if (rounded < @as(f32, @floatFromInt(std.math.minInt(i32)))) {
-                            result = std.math.minInt(i32);
+                        } else if (std.math.isInf(rs1)) {
+                            result = if (rs1 > 0) std.math.maxInt(i32) else std.math.minInt(i32);
                             invalid = true;
                         } else {
-                            result = @intFromFloat(rounded);
+                            const rounded: f32 = switch (rm) {
+                                .rne => arch.FloatHelpers.roundToNearestEvenF32(rs1),
+                                .rtz => if (rs1 >= 0) @floor(rs1) else @ceil(rs1),
+                                .rdn => @floor(rs1),
+                                .rup => @ceil(rs1),
+                                .rmm => if (rs1 >= 0) @floor(rs1 + 0.5) else @ceil(rs1 - 0.5),
+                                else => arch.FloatHelpers.roundToNearestEvenF32(rs1),
+                            };
 
-                            if (rounded != rs1) {
-                                this.registers.fcsr.nx = true;
+                            if (rounded > @as(f32, @floatFromInt(std.math.maxInt(i32)))) {
+                                result = std.math.maxInt(i32);
+                                invalid = true;
+                            } else if (rounded < @as(f32, @floatFromInt(std.math.minInt(i32)))) {
+                                result = std.math.minInt(i32);
+                                invalid = true;
+                            } else {
+                                result = @intFromFloat(rounded);
+
+                                if (rounded != rs1) {
+                                    this.registers.fcsr.nx = true;
+                                }
                             }
                         }
-                    }
 
-                    if (invalid) {
-                        this.registers.fcsr.nv = true;
+                        if (invalid) {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     this.registers.set(i.rd, result);
@@ -997,41 +1347,44 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rm = this.registers.fcsr.getEffectiveRm(i.rm);
 
                     var result: u32 = undefined;
-                    var invalid = false;
 
-                    if (std.math.isNan(rs1)) {
-                        result = std.math.maxInt(u32);
-                        invalid = true;
-                    } else if (std.math.isInf(rs1)) {
-                        result = if (rs1 > 0) std.math.maxInt(u32) else 0;
-                        invalid = true;
-                    } else {
-                        const rounded: f32 = switch (rm) {
-                            .rne => arch.FloatHelpers.roundToNearestEvenF32(rs1),
-                            .rtz => if (rs1 >= 0) @floor(rs1) else @ceil(rs1),
-                            .rdn => @floor(rs1),
-                            .rup => @ceil(rs1),
-                            .rmm => if (rs1 >= 0) @floor(rs1 + 0.5) else @ceil(rs1 - 0.5),
-                            else => arch.FloatHelpers.roundToNearestEvenF32(rs1),
-                        };
+                    if (comptime config.enable_fpu_flags) {
+                        var invalid = false;
 
-                        if (rounded < 0) {
-                            result = 0;
-                            invalid = true;
-                        } else if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u32)))) {
+                        if (std.math.isNan(rs1)) {
                             result = std.math.maxInt(u32);
                             invalid = true;
+                        } else if (std.math.isInf(rs1)) {
+                            result = if (rs1 > 0) std.math.maxInt(u32) else 0;
+                            invalid = true;
                         } else {
-                            result = @intFromFloat(rounded);
+                            const rounded: f32 = switch (rm) {
+                                .rne => arch.FloatHelpers.roundToNearestEvenF32(rs1),
+                                .rtz => if (rs1 >= 0) @floor(rs1) else @ceil(rs1),
+                                .rdn => @floor(rs1),
+                                .rup => @ceil(rs1),
+                                .rmm => if (rs1 >= 0) @floor(rs1 + 0.5) else @ceil(rs1 - 0.5),
+                                else => arch.FloatHelpers.roundToNearestEvenF32(rs1),
+                            };
 
-                            if (rounded != rs1) {
-                                this.registers.fcsr.nx = true;
+                            if (rounded < 0) {
+                                result = 0;
+                                invalid = true;
+                            } else if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u32)))) {
+                                result = std.math.maxInt(u32);
+                                invalid = true;
+                            } else {
+                                result = @intFromFloat(rounded);
+
+                                if (rounded != rs1) {
+                                    this.registers.fcsr.nx = true;
+                                }
                             }
                         }
-                    }
 
-                    if (invalid) {
-                        this.registers.fcsr.nv = true;
+                        if (invalid) {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     this.registers.set(i.rd, @bitCast(result));
@@ -1041,8 +1394,10 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.get(i.rs1);
                     const result: f32 = @floatFromInt(rs1);
 
-                    if (@as(i32, @intFromFloat(result)) != rs1) {
-                        this.registers.fcsr.nx = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (@as(i32, @intFromFloat(result)) != rs1) {
+                            this.registers.fcsr.nx = true;
+                        }
                     }
 
                     this.registers.setF32(i.rd, result);
@@ -1052,8 +1407,10 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1: u32 = @bitCast(this.registers.get(i.rs1));
                     const result: f32 = @floatFromInt(rs1);
 
-                    if (@as(u32, @intFromFloat(result)) != rs1) {
-                        this.registers.fcsr.nx = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (@as(u32, @intFromFloat(result)) != rs1) {
+                            this.registers.fcsr.nx = true;
+                        }
                     }
 
                     this.registers.setF32(i.rd, result);
@@ -1102,39 +1459,46 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs2 = this.registers.getF32(i.rs2);
                     const rs3 = this.registers.getF32(i.rs3);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2) or
-                        arch.FloatHelpers.isSignalingNanF32(rs3))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2) or
+                            arch.FloatHelpers.isSignalingNanF32(rs3))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @mulAdd(f32, rs1, rs2, rs3);
 
                     if (std.math.isNan(result)) {
-                        // If result is NaN but no input was NaN, it's an invalid operation
-                        // (e.g., inf + (-inf) from the fused operation)
-                        if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                            this.registers.fcsr.nv = true;
+                        if (comptime config.enable_fpu_flags) {
+                            // If result is NaN but no input was NaN, it's an invalid operation
+                            // (e.g., inf + (-inf) from the fused operation)
+                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
+                                this.registers.fcsr.nv = true;
+                            }
                         }
+
                         this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                     } else {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2) and
-                            !std.math.isInf(rs3))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1) and
+                                !std.math.isInf(rs2) and
+                                !std.math.isInf(rs3))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
                         }
 
                         this.registers.setF32(i.rd, result);
@@ -1147,38 +1511,46 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs2 = this.registers.getF32(i.rs2);
                     const rs3 = this.registers.getF32(i.rs3);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2) or
-                        arch.FloatHelpers.isSignalingNanF32(rs3))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2) or
+                            arch.FloatHelpers.isSignalingNanF32(rs3))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @mulAdd(f32, rs1, rs2, -rs3);
 
                     if (std.math.isNan(result)) {
-                        if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                            this.registers.fcsr.nv = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
+                                this.registers.fcsr.nv = true;
+                            }
                         }
+
                         this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                     } else {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2) and
-                            !std.math.isInf(rs3))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1) and
+                                !std.math.isInf(rs2) and
+                                !std.math.isInf(rs3))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
                         }
+
                         this.registers.setF32(i.rd, result);
                     }
 
@@ -1189,38 +1561,46 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs2 = this.registers.getF32(i.rs2);
                     const rs3 = this.registers.getF32(i.rs3);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2) or
-                        arch.FloatHelpers.isSignalingNanF32(rs3))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2) or
+                            arch.FloatHelpers.isSignalingNanF32(rs3))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @mulAdd(f32, -rs1, rs2, rs3);
 
                     if (std.math.isNan(result)) {
-                        if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                            this.registers.fcsr.nv = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
+                                this.registers.fcsr.nv = true;
+                            }
                         }
+
                         this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                     } else {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2) and
-                            !std.math.isInf(rs3))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1) and
+                                !std.math.isInf(rs2) and
+                                !std.math.isInf(rs3))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
                         }
+
                         this.registers.setF32(i.rd, result);
                     }
 
@@ -1231,38 +1611,46 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs2 = this.registers.getF32(i.rs2);
                     const rs3 = this.registers.getF32(i.rs3);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1) or
-                        arch.FloatHelpers.isSignalingNanF32(rs2) or
-                        arch.FloatHelpers.isSignalingNanF32(rs3))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1) or
+                            arch.FloatHelpers.isSignalingNanF32(rs2) or
+                            arch.FloatHelpers.isSignalingNanF32(rs3))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @mulAdd(f32, -rs1, rs2, -rs3);
 
                     if (std.math.isNan(result)) {
-                        if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                            this.registers.fcsr.nv = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
+                                this.registers.fcsr.nv = true;
+                            }
                         }
+
                         this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                     } else {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2) and
-                            !std.math.isInf(rs3))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1) and
+                                !std.math.isInf(rs2) and
+                                !std.math.isInf(rs3))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
                         }
+
                         this.registers.setF32(i.rd, result);
                     }
 
@@ -1271,8 +1659,11 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .fld => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
-                    const val = this.readMemory(base +% offset, u64) catch |err| {
-                        return this.memoryErrorToState(err, .load);
+                    const addr = base +% offset;
+                    const val = this.readMemory(addr, u64, .read) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .load, addr);
                     };
 
                     this.registers.setF64(i.rd, @bitCast(val));
@@ -1281,9 +1672,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .fsd => |i| {
                     const base: u32 = @bitCast(this.registers.get(i.rs1));
                     const offset: u32 = @bitCast(@as(i32, i.imm));
+                    const addr = base +% offset;
 
-                    this.writeMemory(base +% offset, @as(u64, @bitCast(this.registers.getF64(i.rs2)))) catch |err| {
-                        return this.memoryErrorToState(err, .store);
+                    this.writeMemory(addr, @as(u64, @bitCast(this.registers.getF64(i.rs2)))) catch |err| {
+                        this.incCounters(true);
+
+                        return memoryErrorToState(err, .store, addr);
                     };
 
                     this.registers.pc +%= 4;
@@ -1292,19 +1686,21 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if (std.math.isInf(rs1) and std.math.isInf(rs2) and (rs1 > 0) != (rs2 > 0)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if (std.math.isInf(rs1) and std.math.isInf(rs2) and (rs1 > 0) != (rs2 > 0)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = rs1 + rs2;
@@ -1316,32 +1712,36 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or arch.FloatHelpers.isSignalingNanF64(rs2)) {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or arch.FloatHelpers.isSignalingNanF64(rs2)) {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    // inf - inf with same signs = NaN
-                    if (std.math.isInf(rs1) and std.math.isInf(rs2) and (rs1 > 0) == (rs2 > 0)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        // inf - inf with same signs = NaN
+                        if (std.math.isInf(rs1) and std.math.isInf(rs2) and (rs1 > 0) == (rs2 > 0)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = rs1 - rs2;
 
-                    if (std.math.isInf(result) and
-                        !std.math.isInf(rs1) and
-                        !std.math.isInf(rs2))
-                    {
-                        this.registers.fcsr.of = true;
-                        this.registers.fcsr.nx = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isInf(result) and
+                            !std.math.isInf(rs1) and
+                            !std.math.isInf(rs2))
+                        {
+                            this.registers.fcsr.of = true;
+                            this.registers.fcsr.nx = true;
+                        }
 
-                    if (arch.FloatHelpers.isSubnormalF64(result)) {
-                        this.registers.fcsr.uf = true;
+                        if (arch.FloatHelpers.isSubnormalF64(result)) {
+                            this.registers.fcsr.uf = true;
+                        }
                     }
 
                     this.registers.setF64(i.rd, if (std.math.isNan(result)) arch.FloatHelpers.canonicalNanF64() else result);
@@ -1351,34 +1751,38 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    // 0 * inf = NaN
-                    if ((rs1 == 0 and std.math.isInf(rs2)) or (std.math.isInf(rs1) and rs2 == 0)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        // 0 * inf = NaN
+                        if ((rs1 == 0 and std.math.isInf(rs2)) or (std.math.isInf(rs1) and rs2 == 0)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = rs1 * rs2;
 
-                    if (std.math.isInf(result) and
-                        !std.math.isInf(rs1) and
-                        !std.math.isInf(rs2))
-                    {
-                        this.registers.fcsr.of = true;
-                        this.registers.fcsr.nx = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isInf(result) and
+                            !std.math.isInf(rs1) and
+                            !std.math.isInf(rs2))
+                        {
+                            this.registers.fcsr.of = true;
+                            this.registers.fcsr.nx = true;
+                        }
 
-                    if (arch.FloatHelpers.isSubnormalF64(result)) {
-                        this.registers.fcsr.uf = true;
+                        if (arch.FloatHelpers.isSubnormalF64(result)) {
+                            this.registers.fcsr.uf = true;
+                        }
                     }
 
                     this.registers.setF64(i.rd, if (std.math.isNan(result)) arch.FloatHelpers.canonicalNanF64() else result);
@@ -1388,38 +1792,42 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    // 0/0 or inf/inf = NaN
-                    if ((rs1 == 0 and rs2 == 0) or
-                        (std.math.isInf(rs1) and std.math.isInf(rs2)))
-                    {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        // 0/0 or inf/inf = NaN
+                        if ((rs1 == 0 and rs2 == 0) or
+                            (std.math.isInf(rs1) and std.math.isInf(rs2)))
+                        {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
-                    }
+                            return .ok;
+                        }
 
-                    // x/0 (x != 0, x != NaN) = ±inf, sets DZ
-                    if (rs2 == 0 and rs1 != 0 and !std.math.isNan(rs1)) {
-                        this.registers.fcsr.dz = true;
+                        // x/0 (x != 0, x != NaN) = ±inf, sets DZ
+                        if (rs2 == 0 and rs1 != 0 and !std.math.isNan(rs1)) {
+                            this.registers.fcsr.dz = true;
+                        }
                     }
 
                     const result = rs1 / rs2;
 
-                    if (std.math.isInf(result) and !std.math.isInf(rs1) and rs2 != 0) {
-                        this.registers.fcsr.of = true;
-                        this.registers.fcsr.nx = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isInf(result) and !std.math.isInf(rs1) and rs2 != 0) {
+                            this.registers.fcsr.of = true;
+                            this.registers.fcsr.nx = true;
+                        }
 
-                    if (arch.FloatHelpers.isSubnormalF64(result)) {
-                        this.registers.fcsr.uf = true;
+                        if (arch.FloatHelpers.isSubnormalF64(result)) {
+                            this.registers.fcsr.uf = true;
+                        }
                     }
 
                     this.registers.setF64(i.rd, if (std.math.isNan(result)) arch.FloatHelpers.canonicalNanF64() else result);
@@ -1428,18 +1836,20 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .fsqrt_d => |i| {
                     const rs1 = this.registers.getF64(i.rs1);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1)) {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1)) {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    // sqrt of negative (except -0) = NaN
-                    if (rs1 < 0 and !arch.FloatHelpers.isNegativeZeroF64(rs1)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        // sqrt of negative (except -0) = NaN
+                        if (rs1 < 0 and !arch.FloatHelpers.isNegativeZeroF64(rs1)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @sqrt(rs1);
@@ -1457,10 +1867,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     const result: f64 = if (std.math.isNan(rs1) and std.math.isNan(rs2))
@@ -1485,10 +1897,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     const result: f64 = if (std.math.isNan(rs1) and std.math.isNan(rs2))
@@ -1538,11 +1952,13 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    // feq: only sNaN sets NV
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2))
-                    {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        // feq: only sNaN sets NV
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     // NaN is never equal to anything (including itself)
@@ -1560,14 +1976,16 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    // flt/fle: any NaN sets NV
-                    if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.set(i.rd, 0);
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                    if (comptime config.enable_fpu_flags) {
+                        // flt/fle: any NaN sets NV
+                        if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.set(i.rd, 0);
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     this.registers.set(i.rd, if (rs1 < rs2) 1 else 0);
@@ -1577,13 +1995,15 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.set(i.rd, 0);
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                    if (comptime config.enable_fpu_flags) {
+                        if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.set(i.rd, 0);
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     this.registers.set(i.rd, if (rs1 <= rs2) 1 else 0);
@@ -1621,14 +2041,18 @@ pub fn Cpu(comptime hooks: Hooks) type {
                         } else {
                             result = @intFromFloat(rounded);
 
-                            if (rounded != rs1) {
-                                this.registers.fcsr.nx = true;
+                            if (comptime config.enable_fpu_flags) {
+                                if (rounded != rs1) {
+                                    this.registers.fcsr.nx = true;
+                                }
                             }
                         }
                     }
 
-                    if (invalid) {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (invalid) {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     this.registers.set(i.rd, result);
@@ -1666,14 +2090,18 @@ pub fn Cpu(comptime hooks: Hooks) type {
                         } else {
                             result = @intFromFloat(rounded);
 
-                            if (rounded != rs1) {
-                                this.registers.fcsr.nx = true;
+                            if (comptime config.enable_fpu_flags) {
+                                if (rounded != rs1) {
+                                    this.registers.fcsr.nx = true;
+                                }
                             }
                         }
                     }
 
-                    if (invalid) {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (invalid) {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     this.registers.set(i.rd, @bitCast(result));
@@ -1726,23 +2154,25 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs2 = this.registers.getF64(i.rs2);
                     const rs3 = this.registers.getF64(i.rs3);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2) or
-                        arch.FloatHelpers.isSignalingNanF64(rs3))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2) or
+                            arch.FloatHelpers.isSignalingNanF64(rs3))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    // inf * 0 or 0 * inf
-                    if ((std.math.isInf(rs1) and rs2 == 0) or
-                        (rs1 == 0 and std.math.isInf(rs2)))
-                    {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        // inf * 0 or 0 * inf
+                        if ((std.math.isInf(rs1) and rs2 == 0) or
+                            (rs1 == 0 and std.math.isInf(rs2)))
+                        {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @mulAdd(f64, rs1, rs2, rs3);
@@ -1750,13 +2180,15 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     if (std.math.isNan(result)) {
                         this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
                     } else {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2) and
-                            !std.math.isInf(rs3))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1) and
+                                !std.math.isInf(rs2) and
+                                !std.math.isInf(rs3))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
                         }
 
                         this.registers.setF64(i.rd, result);
@@ -1769,38 +2201,44 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs2 = this.registers.getF64(i.rs2);
                     const rs3 = this.registers.getF64(i.rs3);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2) or
-                        arch.FloatHelpers.isSignalingNanF64(rs3))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2) or
+                            arch.FloatHelpers.isSignalingNanF64(rs3))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @mulAdd(f64, rs1, rs2, -rs3);
 
                     if (std.math.isNan(result)) {
-                        if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                            this.registers.fcsr.nv = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
+                                this.registers.fcsr.nv = true;
+                            }
                         }
 
                         this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
                     } else {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2) and
-                            !std.math.isInf(rs3))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1) and
+                                !std.math.isInf(rs2) and
+                                !std.math.isInf(rs3))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
                         }
 
                         this.registers.setF64(i.rd, result);
@@ -1813,38 +2251,44 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs2 = this.registers.getF64(i.rs2);
                     const rs3 = this.registers.getF64(i.rs3);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2) or
-                        arch.FloatHelpers.isSignalingNanF64(rs3))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2) or
+                            arch.FloatHelpers.isSignalingNanF64(rs3))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @mulAdd(f64, -rs1, rs2, rs3);
 
                     if (std.math.isNan(result)) {
-                        if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                            this.registers.fcsr.nv = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
+                                this.registers.fcsr.nv = true;
+                            }
                         }
 
                         this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
                     } else {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2) and
-                            !std.math.isInf(rs3))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1) and
+                                !std.math.isInf(rs2) and
+                                !std.math.isInf(rs3))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
                         }
 
                         this.registers.setF64(i.rd, result);
@@ -1857,38 +2301,44 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     const rs2 = this.registers.getF64(i.rs2);
                     const rs3 = this.registers.getF64(i.rs3);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                        arch.FloatHelpers.isSignalingNanF64(rs2) or
-                        arch.FloatHelpers.isSignalingNanF64(rs3))
-                    {
-                        this.registers.fcsr.nv = true;
-                    }
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
+                            arch.FloatHelpers.isSignalingNanF64(rs2) or
+                            arch.FloatHelpers.isSignalingNanF64(rs3))
+                        {
+                            this.registers.fcsr.nv = true;
+                        }
 
-                    if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                        this.registers.fcsr.nv = true;
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                        this.registers.pc +%= 4;
-                        this.incCounters(true);
+                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
+                            this.registers.fcsr.nv = true;
+                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
+                            this.registers.pc +%= 4;
+                            this.incCounters(true);
 
-                        return .ok;
+                            return .ok;
+                        }
                     }
 
                     const result = @mulAdd(f64, -rs1, rs2, -rs3);
 
                     if (std.math.isNan(result)) {
-                        if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                            this.registers.fcsr.nv = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
+                                this.registers.fcsr.nv = true;
+                            }
                         }
 
                         this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
                     } else {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2) and
-                            !std.math.isInf(rs3))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1) and
+                                !std.math.isInf(rs2) and
+                                !std.math.isInf(rs3))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
                         }
 
                         this.registers.setF64(i.rd, result);
@@ -1899,8 +2349,10 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .fcvt_s_d => |i| {
                     const rs1 = this.registers.getF64(i.rs1);
 
-                    if (arch.FloatHelpers.isSignalingNanF64(rs1)) {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF64(rs1)) {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     if (std.math.isNan(rs1)) {
@@ -1908,19 +2360,21 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     } else {
                         const result: f32 = @floatCast(rs1);
 
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
-                        }
+                        if (comptime config.enable_fpu_flags) {
+                            if (std.math.isInf(result) and
+                                !std.math.isInf(rs1))
+                            {
+                                this.registers.fcsr.of = true;
+                                this.registers.fcsr.nx = true;
+                            }
 
-                        if (arch.FloatHelpers.isSubnormalF32(result)) {
-                            this.registers.fcsr.uf = true;
-                        }
+                            if (arch.FloatHelpers.isSubnormalF32(result)) {
+                                this.registers.fcsr.uf = true;
+                            }
 
-                        if (@as(f64, result) != rs1) {
-                            this.registers.fcsr.nx = true;
+                            if (@as(f64, result) != rs1) {
+                                this.registers.fcsr.nx = true;
+                            }
                         }
 
                         this.registers.setF32(i.rd, result);
@@ -1931,8 +2385,10 @@ pub fn Cpu(comptime hooks: Hooks) type {
                 .fcvt_d_s => |i| {
                     const rs1 = this.registers.getF32(i.rs1);
 
-                    if (arch.FloatHelpers.isSignalingNanF32(rs1)) {
-                        this.registers.fcsr.nv = true;
+                    if (comptime config.enable_fpu_flags) {
+                        if (arch.FloatHelpers.isSignalingNanF32(rs1)) {
+                            this.registers.fcsr.nv = true;
+                        }
                     }
 
                     if (std.math.isNan(rs1)) {
@@ -1944,71 +2400,196 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .csrrw => |i| {
+                    const csr: arch.Registers.Csr = @enumFromInt(i.csr);
                     const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
 
-                    if (i.rd != 0) {
-                        const old = this.registers.readCsr(@enumFromInt(i.csr));
+                    if (comptime config.enable_csr_checks) {
+                        if (i.rd != 0) {
+                            const old = this.registers.readCsr(csr) catch {
+                                this.incCounters(true);
 
-                        this.registers.set(i.rd, @bitCast(old));
+                                return trapState(.illegal_instruction, 0);
+                            };
+
+                            this.registers.set(i.rd, @bitCast(old));
+                        }
+
+                        this.registers.writeCsr(csr, rs1_val) catch {
+                            this.incCounters(true);
+
+                            return trapState(.illegal_instruction, 0);
+                        };
+                    } else {
+                        if (i.rd != 0) {
+                            const old = this.registers.readCsrUnchecked(csr);
+
+                            this.registers.set(i.rd, @bitCast(old));
+                        }
+
+                        this.registers.writeCsrUnchecked(csr, rs1_val);
                     }
 
-                    this.registers.writeCsr(@enumFromInt(i.csr), rs1_val);
                     this.registers.pc +%= 4;
                 },
                 .csrrs => |i| {
-                    const old = this.registers.readCsr(@enumFromInt(i.csr));
+                    const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    this.registers.set(i.rd, @bitCast(old));
+                    if (comptime config.enable_csr_checks) {
+                        const old = this.registers.readCsr(csr) catch {
+                            this.incCounters(true);
 
-                    if (i.rs1 != 0) {
-                        const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
+                            return trapState(.illegal_instruction, 0);
+                        };
 
-                        this.registers.writeCsr(@enumFromInt(i.csr), old | rs1_val);
+                        this.registers.set(i.rd, @bitCast(old));
+
+                        if (i.rs1 != 0) {
+                            const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
+
+                            this.registers.writeCsr(csr, old | rs1_val) catch {
+                                this.incCounters(true);
+
+                                return trapState(.illegal_instruction, 0);
+                            };
+                        }
+                    } else {
+                        const old = this.registers.readCsrUnchecked(csr);
+
+                        this.registers.set(i.rd, @bitCast(old));
+
+                        if (i.rs1 != 0) {
+                            const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
+
+                            this.registers.writeCsrUnchecked(csr, old | rs1_val);
+                        }
                     }
 
                     this.registers.pc +%= 4;
                 },
                 .csrrc => |i| {
-                    const old = this.registers.readCsr(@enumFromInt(i.csr));
+                    const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    this.registers.set(i.rd, @bitCast(old));
+                    if (comptime config.enable_csr_checks) {
+                        const old = this.registers.readCsr(csr) catch {
+                            this.incCounters(true);
 
-                    if (i.rs1 != 0) {
-                        const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
+                            return trapState(.illegal_instruction, 0);
+                        };
 
-                        this.registers.writeCsr(@enumFromInt(i.csr), old & ~rs1_val);
+                        this.registers.set(i.rd, @bitCast(old));
+
+                        if (i.rs1 != 0) {
+                            const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
+
+                            this.registers.writeCsr(csr, old & ~rs1_val) catch {
+                                this.incCounters(true);
+
+                                return trapState(.illegal_instruction, 0);
+                            };
+                        }
+                    } else {
+                        const old = this.registers.readCsrUnchecked(csr);
+
+                        this.registers.set(i.rd, @bitCast(old));
+
+                        if (i.rs1 != 0) {
+                            const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
+
+                            this.registers.writeCsrUnchecked(csr, old & ~rs1_val);
+                        }
                     }
 
                     this.registers.pc +%= 4;
                 },
                 .csrrwi => |i| {
-                    if (i.rd != 0) {
-                        const old = this.registers.readCsr(@enumFromInt(i.csr));
+                    const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                        this.registers.set(i.rd, @bitCast(old));
+                    if (comptime config.enable_csr_checks) {
+                        if (i.rd != 0) {
+                            const old = this.registers.readCsr(csr) catch {
+                                this.incCounters(true);
+
+                                return trapState(.illegal_instruction, 0);
+                            };
+
+                            this.registers.set(i.rd, @bitCast(old));
+                        }
+
+                        this.registers.writeCsr(csr, @as(u32, i.uimm)) catch {
+                            this.incCounters(true);
+
+                            return trapState(.illegal_instruction, 0);
+                        };
+                    } else {
+                        if (i.rd != 0) {
+                            const old = this.registers.readCsrUnchecked(csr);
+
+                            this.registers.set(i.rd, @bitCast(old));
+                        }
+
+                        this.registers.writeCsrUnchecked(csr, @as(u32, i.uimm));
                     }
 
-                    this.registers.writeCsr(@enumFromInt(i.csr), @as(u32, i.uimm));
                     this.registers.pc +%= 4;
                 },
                 .csrrsi => |i| {
-                    const old = this.registers.readCsr(@enumFromInt(i.csr));
+                    const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    this.registers.set(i.rd, @bitCast(old));
+                    if (comptime config.enable_csr_checks) {
+                        const old = this.registers.readCsr(csr) catch {
+                            this.incCounters(true);
 
-                    if (i.uimm != 0) {
-                        this.registers.writeCsr(@enumFromInt(i.csr), old | @as(u32, i.uimm));
+                            return trapState(.illegal_instruction, 0);
+                        };
+
+                        this.registers.set(i.rd, @bitCast(old));
+
+                        if (i.uimm != 0) {
+                            this.registers.writeCsr(csr, old | @as(u32, i.uimm)) catch {
+                                this.incCounters(true);
+
+                                return trapState(.illegal_instruction, 0);
+                            };
+                        }
+                    } else {
+                        const old = this.registers.readCsrUnchecked(csr);
+
+                        this.registers.set(i.rd, @bitCast(old));
+
+                        if (i.uimm != 0) {
+                            this.registers.writeCsrUnchecked(csr, old | @as(u32, i.uimm));
+                        }
                     }
 
                     this.registers.pc +%= 4;
                 },
                 .csrrci => |i| {
-                    const old = this.registers.readCsr(@enumFromInt(i.csr));
+                    const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    this.registers.set(i.rd, @bitCast(old));
+                    if (comptime config.enable_csr_checks) {
+                        const old = this.registers.readCsr(csr) catch {
+                            this.incCounters(true);
 
-                    if (i.uimm != 0) {
-                        this.registers.writeCsr(@enumFromInt(i.csr), old & ~@as(u32, i.uimm));
+                            return trapState(.illegal_instruction, 0);
+                        };
+
+                        this.registers.set(i.rd, @bitCast(old));
+
+                        if (i.uimm != 0) {
+                            this.registers.writeCsr(csr, old & ~@as(u32, i.uimm)) catch {
+                                this.incCounters(true);
+
+                                return trapState(.illegal_instruction, 0);
+                            };
+                        }
+                    } else {
+                        const old = this.registers.readCsrUnchecked(csr);
+
+                        this.registers.set(i.rd, @bitCast(old));
+
+                        if (i.uimm != 0) {
+                            this.registers.writeCsrUnchecked(csr, old & ~@as(u32, i.uimm));
+                        }
                     }
 
                     this.registers.pc +%= 4;
@@ -2017,6 +2598,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .sh1add => |i| {
+                    if (comptime !config.enable_zba_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const rs1: u32 = @bitCast(this.registers.get(i.rs1));
                     const rs2: u32 = @bitCast(this.registers.get(i.rs2));
 
@@ -2024,6 +2611,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .sh2add => |i| {
+                    if (comptime !config.enable_zba_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const rs1: u32 = @bitCast(this.registers.get(i.rs1));
                     const rs2: u32 = @bitCast(this.registers.get(i.rs2));
 
@@ -2031,6 +2624,12 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.pc +%= 4;
                 },
                 .sh3add => |i| {
+                    if (comptime !config.enable_zba_ext) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const rs1: u32 = @bitCast(this.registers.get(i.rs1));
                     const rs2: u32 = @bitCast(this.registers.get(i.rs2));
 
@@ -2165,6 +2764,38 @@ pub fn Cpu(comptime hooks: Hooks) type {
                     this.registers.set(i.rd, @bitCast(@byteSwap(rs1)));
                     this.registers.pc +%= 4;
                 },
+                .mret => {
+                    const state = this.executeMret();
+
+                    if (state != .ok) {
+                        this.incCounters(true);
+
+                        return state;
+                    }
+                },
+                .wfi => {
+                    // WFI in U-mode with TW=1 causes illegal instruction
+                    if (this.registers.privilege == .user and this.registers.mstatus.tw) {
+                        this.incCounters(true);
+
+                        return trapState(.illegal_instruction, 0);
+                    }
+
+                    // WFI resumes if any enabled interrupt is pending,
+                    // regardless of whether global interrupts are enabled
+                    const mie: u32 = @bitCast(this.registers.mie);
+                    const mip: u32 = @bitCast(this.registers.mip);
+                    const pending = mie & mip;
+
+                    if (pending != 0) {
+                        // Enabled interrupt is pending - resume execution
+                        this.registers.pc +%= 4;
+                    } else {
+                        this.incCounters(true);
+
+                        return .halt;
+                    }
+                },
             }
 
             this.incCounters(true);
@@ -2185,7 +2816,19 @@ fn initRamWithCode(ram_size: comptime_int, code: []const arch.Instruction) [ram_
     return ram;
 }
 
-const TestCpu = Cpu(.{});
+fn configurePmpFullAccess(cpu: *TestCpu) void {
+    // NAPOT covering entire 32-bit address space (4GB)
+    // pmpaddr with 29 trailing 1s gives size = 8 << 29 = 4GB
+    cpu.registers.pmpaddr[0] = 0x1FFFFFFF;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+}
+
+const TestCpu = Cpu(.{}, .compliant);
 
 test "x0 register is always zero" {
     var ram = initRamWithCode(1024, &.{
@@ -2934,7 +3577,8 @@ test "flw/fsw - load and store float" {
 
     try std.testing.expectEqual(TestCpu.State.ok, cpu.run(3));
 
-    const loaded = try cpu.readMemory(108, u32);
+    const loaded = try cpu.readMemory(108, u32, .read);
+
     try std.testing.expectEqual(@as(u32, @bitCast(pi)), loaded);
     // No FCSR flags should be set for load/store
     try std.testing.expectEqual(@as(u5, 0), cpu.registers.fcsr.getFflags());
@@ -3763,7 +4407,7 @@ test "fld/fsd - load and store double" {
 
     try std.testing.expectEqual(TestCpu.State.ok, cpu.run(3));
 
-    const loaded = try cpu.readMemory(120, u64);
+    const loaded = try cpu.readMemory(120, u64, .read);
     try std.testing.expectEqual(@as(u64, @bitCast(pi)), loaded);
 }
 
@@ -4538,7 +5182,7 @@ test "cycle and instret increment after step" {
 
 test "fence_i advances pc" {
     var ram = initRamWithCode(1024, &.{
-        .{ .fence_i = .{} },
+        .{ .fence_i = {} },
         .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
     });
     var cpu: TestCpu = .init(&ram);
@@ -5150,52 +5794,20 @@ test "sh3add for array indexing (element size 8)" {
     try std.testing.expectEqual(@as(i32, 0x1028), cpu.registers.get(3)); // base + index * 8
 }
 
-test "ecall - hook returns false, produces exception" {
+test "ebreak - produces breakpoint trap" {
     var ram = initRamWithCode(1024, &.{
-        .{ .ecall = .{} },
+        .ebreak,
     });
     var cpu: TestCpu = .init(&ram);
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.State.exception, std.meta.activeTag(state));
-    try std.testing.expectEqual(TestCpu.Exception.Kind.ecall_from_u, state.exception.kind);
-    try std.testing.expectEqual(@as(u32, 0), cpu.registers.pc); // PC not advanced
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.breakpoint, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 0), state.trap.tval); // breakpoint: tval = PC
 }
 
-test "ebreak - produces breakpoint exception" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .ebreak = .{} },
-    });
-    var cpu: TestCpu = .init(&ram);
-
-    const state = cpu.step();
-
-    try std.testing.expectEqual(TestCpu.State.exception, std.meta.activeTag(state));
-    try std.testing.expectEqual(TestCpu.Exception.Kind.breakpoint, state.exception.kind);
-}
-
-test "exception resolveAndSkip advances PC" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .ecall = .{} },
-        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-
-    var state = cpu.step();
-    try std.testing.expectEqual(TestCpu.Exception.Kind.ecall_from_u, state.exception.kind);
-
-    state.exception.resolveAndSkip();
-    try std.testing.expectEqual(@as(u32, 4), cpu.registers.pc);
-
-    // Continue execution
-    const state2 = cpu.step();
-
-    try std.testing.expectEqual(TestCpu.State.ok, state2);
-    try std.testing.expectEqual(@as(i32, 42), cpu.registers.get(1));
-}
-
-test "load - address out of bounds produces exception" {
+test "load - address out of bounds produces trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .lw = .{ .rd = 1, .rs1 = 2, .imm = 0 } },
     });
@@ -5204,10 +5816,12 @@ test "load - address out of bounds produces exception" {
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.Exception.Kind.load_access_fault, state.exception.kind);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_access_fault, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 2000), state.trap.tval); // Faulting address
 }
 
-test "store - address out of bounds produces exception" {
+test "store - address out of bounds produces trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .sw = .{ .rs1 = 2, .rs2 = 1, .imm = 0 } },
     });
@@ -5217,10 +5831,12 @@ test "store - address out of bounds produces exception" {
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.Exception.Kind.store_access_fault, state.exception.kind);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 2000), state.trap.tval);
 }
 
-test "lh - misaligned address produces exception" {
+test "lh - misaligned address produces trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .lh = .{ .rd = 1, .rs1 = 2, .imm = 0 } },
     });
@@ -5229,10 +5845,12 @@ test "lh - misaligned address produces exception" {
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.Exception.Kind.load_address_misaligned, state.exception.kind);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_address_misaligned, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 101), state.trap.tval);
 }
 
-test "lw - misaligned address produces exception" {
+test "lw - misaligned address produces trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .lw = .{ .rd = 1, .rs1 = 2, .imm = 0 } },
     });
@@ -5241,10 +5859,12 @@ test "lw - misaligned address produces exception" {
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.Exception.Kind.load_address_misaligned, state.exception.kind);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_address_misaligned, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 102), state.trap.tval);
 }
 
-test "sh - misaligned address produces exception" {
+test "sh - misaligned address produces trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .sh = .{ .rs1 = 2, .rs2 = 1, .imm = 0 } },
     });
@@ -5254,10 +5874,12 @@ test "sh - misaligned address produces exception" {
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.Exception.Kind.store_address_misaligned, state.exception.kind);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_address_misaligned, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 101), state.trap.tval);
 }
 
-test "sw - misaligned address produces exception" {
+test "sw - misaligned address produces trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .sw = .{ .rs1 = 2, .rs2 = 1, .imm = 0 } },
     });
@@ -5267,10 +5889,12 @@ test "sw - misaligned address produces exception" {
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.Exception.Kind.store_address_misaligned, state.exception.kind);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_address_misaligned, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 102), state.trap.tval);
 }
 
-test "fld - misaligned address produces exception" {
+test "fld - misaligned address produces trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .fld = .{ .rd = 0, .rs1 = 1, .imm = 0 } },
     });
@@ -5279,10 +5903,12 @@ test "fld - misaligned address produces exception" {
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.Exception.Kind.load_address_misaligned, state.exception.kind);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_address_misaligned, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 100), state.trap.tval);
 }
 
-test "fsd - misaligned address produces exception" {
+test "fsd - misaligned address produces trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .fsd = .{ .rs1 = 1, .rs2 = 0, .imm = 0 } },
     });
@@ -5291,7 +5917,9 @@ test "fsd - misaligned address produces exception" {
 
     const state = cpu.step();
 
-    try std.testing.expectEqual(TestCpu.Exception.Kind.store_address_misaligned, state.exception.kind);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_address_misaligned, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 100), state.trap.tval);
 }
 
 test "NaN-boxing - reading non-boxed f32 returns NaN" {
@@ -5557,7 +6185,7 @@ test "fadd_s - subnormal result sets UF flag" {
     try std.testing.expectEqual(@as(u32, 0), exp); // Subnormal has exp=0
 }
 
-test "csrrs - writing to read-only CSR (cycle) is ignored" {
+test "csrrs - writing to read-only CSR (cycle) raises illegal instruction" {
     var ram = initRamWithCode(1024, &.{
         .{ .csrrs = .{ .rd = 1, .rs1 = 2, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
     });
@@ -5565,9 +6193,63 @@ test "csrrs - writing to read-only CSR (cycle) is ignored" {
     cpu.registers.cycle = 100;
     cpu.registers.set(2, @bitCast(@as(u32, 0xFFFFFFFF)));
 
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.illegal_instruction, state.trap.cause.exception);
+}
+
+test "csrrs - reading read-only CSR (cycle) with rs1=x0 succeeds" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.cycle = 100;
+
     try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
-    // Cycle counter should be unchanged (read-only) except for the step increment
+    // Value read before increment, but increment happens during step
+    try std.testing.expectEqual(@as(i32, 100), cpu.registers.get(1));
     try std.testing.expectEqual(@as(u64, 101), cpu.registers.cycle);
+}
+
+test "mcycle/minstret are writable in M-mode" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrw = .{ .rd = 0, .rs1 = 1, .csr = @intFromEnum(arch.Registers.Csr.mcycle) } },
+        .{ .csrrw = .{ .rd = 0, .rs1 = 2, .csr = @intFromEnum(arch.Registers.Csr.minstret) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.cycle = 100;
+    cpu.registers.instret = 200;
+    cpu.registers.set(1, 1000);
+    cpu.registers.set(2, 2000);
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    // After step 1: cycle = 1000 (written) + 1 (increment) = 1001
+    //               instret = 200 + 1 = 201 (not written yet)
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    // After step 2: cycle = 1001 + 1 = 1002
+    //               instret = 2000 (written) + 1 (increment) = 2001
+
+    try std.testing.expectEqual(@as(u64, 1002), cpu.registers.cycle);
+    try std.testing.expectEqual(@as(u64, 2001), cpu.registers.instret);
+}
+
+test "wfi resumes when enabled interrupt is pending (even if MIE=0)" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.mie.mtie = true; // Timer interrupt enabled in mie
+    cpu.registers.mip.mtip = true; // Timer interrupt pending
+    cpu.registers.mstatus.mie = false; // Global interrupts disabled
+
+    const state = cpu.step();
+
+    // WFI sees enabled pending interrupt, resumes without halting
+    // (interrupt won't actually be taken because mstatus.mie=0)
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(u32, 4), cpu.registers.pc);
 }
 
 test "csrrw - fcsr only uses lower 8 bits" {
@@ -5606,7 +6288,7 @@ test "instret counter wraps on overflow" {
 
 test "fence advances PC and counts as retired" {
     var ram = initRamWithCode(1024, &.{
-        .{ .fence = .{} },
+        .{ .fence = {} },
         .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
     });
     var cpu: TestCpu = .init(&ram);
@@ -5698,13 +6380,26 @@ test "flt_s - both operands qNaN sets NV" {
 
 test "jal - maximum positive offset" {
     var ram = initRamWithCode(4096, &.{
-        .{ .jal = .{ .rd = 1, .imm = 2046 } }, // Near max positive (must be even)
+        .{ .jal = .{ .rd = 1, .imm = 2044 } }, // Must be 4-byte aligned
     });
     var cpu: TestCpu = .init(&ram);
 
     try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
-    try std.testing.expectEqual(@as(u32, 2046), cpu.registers.pc);
+    try std.testing.expectEqual(@as(u32, 2044), cpu.registers.pc);
     try std.testing.expectEqual(@as(i32, 4), cpu.registers.get(1)); // Return address
+}
+
+test "jal - misaligned target causes trap" {
+    var ram = initRamWithCode(4096, &.{
+        .{ .jal = .{ .rd = 1, .imm = 2046 } }, // Not 4-byte aligned
+    });
+    var cpu: TestCpu = .init(&ram);
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.instruction_address_misaligned, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 2046), state.trap.tval);
 }
 
 test "jalr - handles wrap-around correctly" {
@@ -5761,21 +6456,17 @@ test "timeh CSR mirrors cycleh CSR" {
     try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xCAFEBABE))), cpu.registers.get(1));
 }
 
-test "cycle and instret counters are read-only via CSR write" {
+test "cycle and instret CSRs are read-only - write attempts trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .csrrw = .{ .rd = 0, .rs1 = 1, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
-        .{ .csrrw = .{ .rd = 0, .rs1 = 1, .csr = @intFromEnum(arch.Registers.Csr.instret) } },
     });
     var cpu: TestCpu = .init(&ram);
-    cpu.registers.cycle = 100;
-    cpu.registers.instret = 200;
     cpu.registers.set(1, @bitCast(@as(u32, 0xFFFFFFFF)));
 
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    const state = cpu.step();
 
-    try std.testing.expectEqual(@as(u64, 102), cpu.registers.cycle);
-    try std.testing.expectEqual(@as(u64, 202), cpu.registers.instret);
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.illegal_instruction, state.trap.cause.exception);
 }
 
 test "cycle increments on each instruction" {
@@ -5851,10 +6542,22 @@ test "instret overflow from 32-bit to 64-bit boundary" {
     try std.testing.expectEqual(@as(i32, 1), cpu.registers.get(2));
 }
 
-test "csrrsi and csrrci cannot modify read-only counters" {
+test "csrrsi/csrrci on read-only CSRs with non-zero uimm trap" {
     var ram = initRamWithCode(1024, &.{
         .{ .csrrsi = .{ .rd = 1, .uimm = 0x1F, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
-        .{ .csrrci = .{ .rd = 2, .uimm = 0x1F, .csr = @intFromEnum(arch.Registers.Csr.instret) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.illegal_instruction, state.trap.cause.exception);
+}
+
+test "csrrsi/csrrci on read-only CSRs with uimm=0 succeeds (read-only operation)" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrsi = .{ .rd = 1, .uimm = 0, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
+        .{ .csrrci = .{ .rd = 2, .uimm = 0, .csr = @intFromEnum(arch.Registers.Csr.instret) } },
     });
     var cpu: TestCpu = .init(&ram);
     cpu.registers.cycle = 1000;
@@ -5863,6 +6566,617 @@ test "csrrsi and csrrci cannot modify read-only counters" {
     try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
     try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
 
-    try std.testing.expectEqual(@as(u64, 1002), cpu.registers.cycle);
-    try std.testing.expectEqual(@as(u64, 2002), cpu.registers.instret);
+    try std.testing.expectEqual(@as(i32, 1000), cpu.registers.get(1));
+    try std.testing.expectEqual(@as(i32, 2001), cpu.registers.get(2));
+}
+
+test "U-mode cannot access M-mode CSRs" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.mstatus) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    configurePmpFullAccess(&cpu);
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.illegal_instruction, state.trap.cause.exception);
+}
+
+test "M-mode can access all CSRs" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.mstatus) } },
+        .{ .csrrs = .{ .rd = 2, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.fcsr) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+}
+
+test "U-mode counter access controlled by mcounteren" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mcounteren.cy = false;
+    configurePmpFullAccess(&cpu);
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.illegal_instruction, state.trap.cause.exception);
+}
+
+test "U-mode counter access allowed when mcounteren.cy is set" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mcounteren.cy = true;
+    cpu.registers.cycle = 12345;
+    configurePmpFullAccess(&cpu);
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(i32, 12345), cpu.registers.get(1));
+}
+
+test "Write to read-only CSR causes illegal instruction" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrw = .{ .rd = 0, .rs1 = 1, .csr = @intFromEnum(arch.Registers.Csr.mvendorid) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.set(1, 0x12345678);
+
+    const state = cpu.step();
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.illegal_instruction, state.trap.cause.exception);
+}
+
+test "ecall - hook returns false, produces trap" {
+    var ram = initRamWithCode(1024, &.{
+        .ecall,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    configurePmpFullAccess(&cpu);
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.ecall_from_u, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 0), cpu.registers.pc);
+    try std.testing.expectEqual(@as(u32, 0), state.trap.tval);
+}
+
+test "ecall from U-mode - produces trap" {
+    var ram = initRamWithCode(1024, &.{
+        .ecall,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
+    configurePmpFullAccess(&cpu);
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.ecall_from_u, state.trap.cause.exception);
+}
+
+test "ecall from M-mode - produces trap" {
+    var ram = initRamWithCode(1024, &.{
+        .ecall,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.ecall_from_m, state.trap.cause.exception);
+}
+
+test "handleTrap saves correct state" {
+    var ram = initRamWithCode(1024, &.{
+        .ecall,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.pc = 0x1000;
+    cpu.registers.mstatus.mie = true;
+    cpu.registers.mtvec = .{ .base = 0x2000 >> 2, .mode = .direct };
+
+    cpu.handleTrap(.{ .exception = .ecall_from_u }, 0);
+
+    try std.testing.expectEqual(@as(u32, 0x1000), cpu.registers.mepc);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.ecall_from_u, @as(arch.Registers.Mcause.Exception, @enumFromInt(cpu.registers.mcause.code)));
+    try std.testing.expectEqual(false, cpu.registers.mcause.interrupt);
+    try std.testing.expectEqual(arch.PrivilegeLevel.user, cpu.registers.mstatus.mpp);
+    try std.testing.expectEqual(true, cpu.registers.mstatus.mpie);
+    try std.testing.expectEqual(false, cpu.registers.mstatus.mie);
+    try std.testing.expectEqual(arch.PrivilegeLevel.machine, cpu.registers.privilege);
+    try std.testing.expectEqual(@as(u32, 0x2000), cpu.registers.pc);
+}
+
+test "mtvec vectored mode calculates correct interrupt address" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.mtvec = .{ .base = 0x1000 >> 2, .mode = .vectored };
+
+    // Machine timer interrupt (code = 7)
+    cpu.handleTrap(.{ .interrupt = .machine_timer }, 0);
+
+    try std.testing.expectEqual(@as(u32, 0x1000 + 7 * 4), cpu.registers.pc);
+}
+
+test "mtvec vectored mode uses base for exceptions" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.mtvec = .{ .base = 0x1000 >> 2, .mode = .vectored };
+
+    cpu.handleTrap(.{ .exception = .illegal_instruction }, 0);
+
+    try std.testing.expectEqual(@as(u32, 0x1000), cpu.registers.pc);
+}
+
+test "mret restores privilege and PC" {
+    var ram = initRamWithCode(1024, &.{
+        .mret,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.mstatus.mpp = .user;
+    cpu.registers.mstatus.mpie = true;
+    cpu.registers.mstatus.mie = false;
+    cpu.registers.mepc = 0x2000;
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+
+    try std.testing.expectEqual(arch.PrivilegeLevel.user, cpu.registers.privilege);
+    try std.testing.expectEqual(@as(u32, 0x2000), cpu.registers.pc);
+    try std.testing.expectEqual(true, cpu.registers.mstatus.mie);
+    try std.testing.expectEqual(true, cpu.registers.mstatus.mpie);
+    try std.testing.expectEqual(arch.PrivilegeLevel.user, cpu.registers.mstatus.mpp);
+}
+
+test "mret in U-mode causes illegal instruction" {
+    var ram = initRamWithCode(1024, &.{
+        .mret,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    configurePmpFullAccess(&cpu);
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.illegal_instruction, state.trap.cause.exception);
+}
+
+test "full trap and return cycle" {
+    var ram = initRamWithCode(1024, &.{
+        .ecall, // 0x000: ecall in user mode
+    });
+    // Place mret at trap handler address
+    const mret_encoded = (arch.Instruction{ .mret = {} }).encode();
+    std.mem.writeInt(u32, ram[0x100..0x104], mret_encoded, arch.ENDIAN);
+
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
+    cpu.registers.mstatus.mie = true;
+
+    // Execute ecall - should trap
+    var state = cpu.step();
+    try std.testing.expect(state == .trap);
+
+    // Handle the trap
+    cpu.handleTrap(state.trap.cause, state.trap.tval);
+
+    try std.testing.expectEqual(arch.PrivilegeLevel.machine, cpu.registers.privilege);
+    try std.testing.expectEqual(@as(u32, 0x100), cpu.registers.pc);
+
+    // Execute mret - should return to user mode
+    state = cpu.step();
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(arch.PrivilegeLevel.user, cpu.registers.privilege);
+}
+
+test "wfi halts when no enabled interrupts pending" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.mie.mtie = false; // Timer interrupt NOT enabled in mie
+    cpu.registers.mip.mtip = true; // Timer interrupt pending but not enabled
+    cpu.registers.mstatus.mie = true;
+
+    const state = cpu.step();
+
+    // Pending interrupt is not enabled in mie, so WFI halts
+    try std.testing.expectEqual(TestCpu.State.halt, state);
+}
+
+test "wfi - interrupt pending causes trap before wfi executes" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.mie.mtie = true;
+    cpu.registers.mip.mtip = true;
+    cpu.registers.mstatus.mie = true;
+    cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
+
+    const state = cpu.step();
+
+    // Interrupt is taken BEFORE wfi executes
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(u32, 0x100), cpu.registers.pc); // Jumped to trap handler
+    try std.testing.expectEqual(true, cpu.registers.mcause.interrupt);
+    try std.testing.expectEqual(@as(u31, 7), cpu.registers.mcause.code); // Timer interrupt
+}
+
+test "wfi executes when interrupts pending but disabled" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.mie.mtie = true;
+    cpu.registers.mip.mtip = true;
+    cpu.registers.mstatus.mie = false; // Interrupts disabled
+
+    const state = cpu.step();
+
+    // WFI sees pending interrupt but MIE=0, so it doesn't halt
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(u32, 4), cpu.registers.pc);
+}
+
+test "wfi in U-mode with TW=1 causes illegal instruction" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mstatus.tw = true;
+    configurePmpFullAccess(&cpu);
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.illegal_instruction, state.trap.cause.exception);
+}
+
+test "wfi in U-mode with TW=0 is allowed" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mstatus.tw = false;
+    configurePmpFullAccess(&cpu);
+
+    const state = cpu.step();
+
+    try std.testing.expectEqual(TestCpu.State.halt, state);
+}
+
+test "timer interrupt taken when enabled and pending" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 1 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.mstatus.mie = true;
+    cpu.registers.mie.mtie = true;
+    cpu.registers.mip.mtip = true;
+    cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
+
+    const state = cpu.step();
+
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(u32, 0x100), cpu.registers.pc);
+    try std.testing.expectEqual(true, cpu.registers.mcause.interrupt);
+    try std.testing.expectEqual(@as(u31, 7), cpu.registers.mcause.code);
+}
+
+test "interrupt not taken when MIE is clear in M-mode" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.mstatus.mie = false;
+    cpu.registers.mie.mtie = true;
+    cpu.registers.mip.mtip = true;
+
+    const state = cpu.step();
+
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(i32, 42), cpu.registers.get(1));
+}
+
+test "interrupt taken in U-mode even with MIE clear" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mstatus.mie = false;
+    cpu.registers.mie.mtie = true;
+    cpu.registers.mip.mtip = true;
+    cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
+
+    const state = cpu.step();
+
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(u32, 0x100), cpu.registers.pc);
+}
+
+test "interrupt priority: external > software > timer" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.mstatus.mie = true;
+    cpu.registers.mie = .{ .meie = true, .msie = true, .mtie = true };
+    cpu.registers.mip = .{ .meip = true, .msip = true, .mtip = true };
+    cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .vectored };
+
+    _ = cpu.step();
+
+    // External interrupt has code 11
+    try std.testing.expectEqual(@as(u31, 11), cpu.registers.mcause.code);
+}
+
+test "PMP denies U-mode access to unprotected memory" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .lw = .{ .rd = 1, .rs1 = 0, .imm = 0x100 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // Configure PMP to allow execute for code region only (0x000-0x100)
+    cpu.registers.pmpaddr[0] = 0x3F; // NAPOT 0x000-0x100
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = false, // No read
+        .w = false, // No write
+        .x = true, // Execute only
+        .a = .napot,
+    }));
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_access_fault, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 0x100), state.trap.tval);
+}
+
+test "PMP allows M-mode access without configuration" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .lw = .{ .rd = 1, .rs1 = 2, .imm = 0 } },
+    });
+    std.mem.writeInt(u32, ram[0x100..0x104], 0xDEADBEEF, arch.ENDIAN);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.set(2, 0x100);
+
+    const state = cpu.step();
+
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xDEADBEEF))), cpu.registers.get(1));
+}
+
+test "PMP NAPOT mode allows access within range" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .lw = .{ .rd = 1, .rs1 = 2, .imm = 0 } },
+    });
+    std.mem.writeInt(u32, ram[0x100..0x104], 0x12345678, arch.ENDIAN);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.set(2, 0x100);
+
+    // Configure PMP0: NAPOT covering 0x000-0x1FF (512 bytes), RWX
+    // For 512 bytes: pmpaddr = (base >> 2) | ((size/2 - 1) >> 2) = 0 | 0x3F = 0x3F
+    cpu.registers.pmpaddr[0] = 0x3F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+
+    const state = cpu.step();
+
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(i32, 0x12345678), cpu.registers.get(1));
+}
+
+test "PMP denies access outside configured range" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .lw = .{ .rd = 1, .rs1 = 2, .imm = 0 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.set(2, 0x200); // Outside PMP0 range
+
+    // Configure PMP0: NAPOT covering 0x000-0x0FF (256 bytes)
+    cpu.registers.pmpaddr[0] = 0x1F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_access_fault, state.trap.cause.exception);
+}
+
+test "PMP TOR mode works correctly" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .lw = .{ .rd = 1, .rs1 = 2, .imm = 0 } },
+    });
+    std.mem.writeInt(u32, ram[0x80..0x84], 0xCAFEBABE, arch.ENDIAN);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.set(2, 0x80);
+
+    // Configure PMP0: TOR from 0x40 to 0x100 (pmpaddr0 in units of 4 bytes)
+    // Previous address is 0, so range is [0, 0x100)
+    cpu.registers.pmpaddr[0] = 0x100 >> 2; // 0x40
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .tor,
+    }));
+
+    const state = cpu.step();
+
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xCAFEBABE))), cpu.registers.get(1));
+}
+
+test "PMP locked entry cannot be modified" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+
+    // Configure and lock PMP0
+    const locked_cfg = arch.Registers.PmpCfg{
+        .r = true,
+        .w = false,
+        .x = false,
+        .a = .napot,
+        .l = true,
+    };
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(locked_cfg));
+    cpu.registers.pmpaddr[0] = 0x1F;
+
+    // Try to modify - should be ignored
+    cpu.registers.setPmpCfg(0, .{ .r = true, .w = true, .x = true, .a = .napot });
+    cpu.registers.writePmpaddr(0, 0xFF);
+
+    const cfg = cpu.registers.getPmpCfg(0);
+    try std.testing.expectEqual(false, cfg.w);
+    try std.testing.expectEqual(@as(u32, 0x1F), cpu.registers.pmpaddr[0]);
+}
+
+test "PMP locked entry enforced even in M-mode" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .sw = .{ .rs1 = 2, .rs2 = 1, .imm = 0 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .machine;
+    cpu.registers.set(1, 0x12345678);
+    cpu.registers.set(2, 0x100);
+
+    // NAPOT address calculation:
+    // For size 2^n bytes: pmpaddr needs (n-3) trailing 1s
+    // For 256 bytes (n=8): need 5 trailing 1s
+    // For region at base B: pmpaddr = (B >> 2) | ((1 << (n-3)) - 1) >> 1
+    //                                = (B >> 2) | (size/8 - 1)
+
+    // PMP0: Code region 0x000-0x100 (256 bytes), locked, RX
+    // pmpaddr = 0 | (256/8 - 1) = 0x1F
+    cpu.registers.pmpaddr[0] = 0x1F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = false,
+        .x = true,
+        .a = .napot,
+        .l = true,
+    }));
+
+    // PMP1: Data region 0x100-0x200 (256 bytes), locked, R-only (no write!)
+    // pmpaddr = (0x100 >> 2) | (256/8 - 1) = 0x40 | 0x1F = 0x5F
+    cpu.registers.pmpaddr[1] = 0x5F;
+    cpu.registers.pmpcfg[0] |= @as(u32, @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = false, // No write permission!
+        .x = false,
+        .a = .napot,
+        .l = true, // Locked - enforced even in M-mode
+    }))) << 8;
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 0x100), state.trap.tval);
+}
+
+test "PMP execute permission checked for instruction fetch" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    // Place valid instruction at 0x100
+    const addi = (arch.Instruction{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } }).encode();
+    std.mem.writeInt(u32, ram[0x100..0x104], addi, arch.ENDIAN);
+
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.pc = 0x100;
+
+    // Configure PMP0: RW but no X
+    cpu.registers.pmpaddr[0] = 0x7F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = false,
+        .a = .napot,
+    }));
+
+    const state = cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.instruction_access_fault, state.trap.cause.exception);
+}
+
+test "trap handling and resume advances PC" {
+    var ram = initRamWithCode(1024, &.{
+        .ecall,
+        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
+    configurePmpFullAccess(&cpu);
+
+    // Place mret at trap handler
+    const mret_encoded = (arch.Instruction{ .mret = {} }).encode();
+    std.mem.writeInt(u32, ram[0x100..0x104], mret_encoded, arch.ENDIAN);
+
+    var state = cpu.step();
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.ecall_from_u, state.trap.cause.exception);
+
+    // Handle the trap
+    cpu.handleTrap(state.trap.cause, state.trap.tval);
+    try std.testing.expectEqual(@as(u32, 0x100), cpu.registers.pc);
+    try std.testing.expectEqual(@as(u32, 0), cpu.registers.mepc);
+    try std.testing.expectEqual(arch.PrivilegeLevel.machine, cpu.registers.privilege);
+
+    // Simulate trap handler advancing mepc to skip ecall
+    cpu.registers.mepc +%= 4;
+
+    // Execute mret
+    state = cpu.step();
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(u32, 4), cpu.registers.pc);
+    try std.testing.expectEqual(arch.PrivilegeLevel.user, cpu.registers.privilege);
+
+    // Continue execution
+    state = cpu.step();
+    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(i32, 42), cpu.registers.get(1));
 }

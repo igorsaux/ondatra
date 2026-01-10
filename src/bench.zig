@@ -240,10 +240,14 @@ const Config = struct {
     runs: usize = 2048,
 };
 
+const BenchmarkFunc = fn (allocator: std.mem.Allocator, r: *Runner) bool;
+
 const Benchmark = struct {
+    pub const Func = fn (allocator: std.mem.Allocator, r: *Runner) bool;
+
     name: []const u8,
     config: Config = .{},
-    func: *const fn (allocator: std.mem.Allocator, r: *Runner) bool,
+    func: *const Func,
 };
 
 pub fn main() !void {
@@ -251,10 +255,14 @@ pub fn main() !void {
     defer _ = alloc.deinit();
 
     const benchs = [_]Benchmark{
-        .{ .name = "fibbonacci", .func = fibbonacciBenchmark },
-        .{ .name = "float_minmax_abs", .func = floatMinMaxAbsBenchmark },
-        .{ .name = "float_arithmetic", .func = floatArithmeticBenchmark },
-        .{ .name = "floatSqrtFmaBenchmark", .func = floatSqrtFmaBenchmark },
+        .{ .name = "fibbonacci_compilant", .func = fibbonacciCompilantBenchmark },
+        .{ .name = "fibbonacci_fast", .func = fibbonacciFastBenchmark },
+        .{ .name = "floatMinMaxAbs_compilant", .func = floatMinMaxAbsCompilantBenchmark },
+        .{ .name = "floatMinMaxAbs_fast", .func = floatMinMaxAbsFastBenchmark },
+        .{ .name = "floatArithmetic_compilant", .func = floatArithmeticCompilantBenchmark },
+        .{ .name = "floatArithmetic_fast", .func = floatArithmeticFastBenchmark },
+        .{ .name = "floatSqrtFma_compilant", .func = floatSqrtFmaCompilantBenchmark },
+        .{ .name = "floatSqrtFma_fast", .func = floatSqrtFmaFastBenchmark },
     };
     var runner: Runner = .init();
 
@@ -263,230 +271,91 @@ pub fn main() !void {
     }
 }
 
-fn fibbonacciBenchmark(allocator: std.mem.Allocator, r: *Runner) bool {
-    const PROGRAM = @embedFile("fibbonacci.bin");
+/// Like `.fast` but with enabled counters of course!
+const FAST: ondatra.cpu.Config = .{
+    .enable_pmp = false,
+    .enable_memory_alignment = false,
+    .enable_privilege = false,
+    .enable_csr_checks = false,
+    .enable_interrupts = false,
+    .enable_branch_alignment = false,
+    .enable_fpu_flags = false,
+};
 
-    const State = struct {
-        const Cpu = ondatra.cpu.Cpu(.{
-            .ecall = ecall,
-        });
+const fibbonacciCompilantBenchmark = MakeBenchmark("fibbonacci.bin", .compliant);
+const fibbonacciFastBenchmark = MakeBenchmark("fibbonacci.bin", FAST);
 
-        over: bool = false,
-        cpu: Cpu,
+const floatMinMaxAbsCompilantBenchmark = MakeBenchmark("float_minmax_abs.bin", .compliant);
+const floatMinMaxAbsFastBenchmark = MakeBenchmark("float_minmax_abs.bin", FAST);
 
-        inline fn ecall(ctx: *anyopaque) bool {
-            const this: *Cpu = @ptrCast(@alignCast(ctx));
-            const state: *@This() = @fieldParentPtr("cpu", this);
+const floatArithmeticCompilantBenchmark = MakeBenchmark("float_arithmetic.bin", .compliant);
+const floatArithmeticFastBenchmark = MakeBenchmark("float_arithmetic.bin", FAST);
 
-            state.over = true;
+const floatSqrtFmaCompilantBenchmark = MakeBenchmark("float_sqrt_fma.bin", .compliant);
+const floatSqrtFmaFastBenchmark = MakeBenchmark("float_sqrt_fma.bin", FAST);
+
+fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Config) Benchmark.Func {
+    return struct {
+        fn func(allocator: std.mem.Allocator, r: *Runner) bool {
+            const PROGRAM = @embedFile(program);
+
+            const State = struct {
+                const Cpu = ondatra.cpu.Cpu(.{
+                    .ecall = ecall,
+                }, config);
+
+                over: bool = false,
+                cpu: Cpu,
+
+                inline fn ecall(ctx: *anyopaque) bool {
+                    const this: *Cpu = @ptrCast(@alignCast(ctx));
+                    const state: *@This() = @fieldParentPtr("cpu", this);
+
+                    state.over = true;
+
+                    return true;
+                }
+            };
+
+            var ram = std.mem.zeroes([std.math.pow(usize, 2, 12)]u8);
+            var state: State = .{
+                .cpu = .init(&ram),
+            };
+
+            state.cpu.loadElf(allocator, PROGRAM) catch |err| {
+                std.debug.print("failed to load the program: {t}\n", .{err});
+
+                return false;
+            };
+
+            std.mem.doNotOptimizeAway(&state);
+            std.mem.doNotOptimizeAway(&state.cpu);
+            std.mem.doNotOptimizeAway(&ram);
+
+            r.begin() catch unreachable;
+
+            while (!state.over) {
+                const step_state = state.cpu.step();
+                std.mem.doNotOptimizeAway(&step_state);
+
+                switch (step_state) {
+                    .ok => continue,
+                    .trap => |i| {
+                        std.debug.print("unexpected trap: {any}\n", .{i.cause});
+
+                        return false;
+                    },
+                    .halt => {
+                        std.debug.print("unexpected halt\n", .{});
+
+                        return false;
+                    },
+                }
+            }
+
+            r.end(state.cpu.registers.instret) catch unreachable;
 
             return true;
         }
-    };
-
-    var ram = std.mem.zeroes([std.math.pow(usize, 2, 12)]u8);
-    var state: State = .{
-        .cpu = .init(&ram),
-    };
-
-    state.cpu.loadElf(allocator, PROGRAM) catch |err| {
-        std.debug.print("failed to load the program: {t}\n", .{err});
-
-        return false;
-    };
-
-    std.mem.doNotOptimizeAway(&state);
-    std.mem.doNotOptimizeAway(&state.cpu);
-    std.mem.doNotOptimizeAway(&ram);
-
-    r.begin() catch unreachable;
-
-    while (!state.over) {
-        const step_state = state.cpu.step();
-        std.mem.doNotOptimizeAway(&step_state);
-
-        switch (step_state) {
-            .ok => continue,
-            .exception => |e| {
-                std.debug.print("unexpected exception: {t}\n", .{e.kind});
-
-                return false;
-            },
-        }
-    }
-
-    r.end(state.cpu.registers.instret) catch unreachable;
-
-    return true;
-}
-
-fn floatMinMaxAbsBenchmark(allocator: std.mem.Allocator, r: *Runner) bool {
-    const PROGRAM = @embedFile("float_minmax_abs.bin");
-
-    const State = struct {
-        const Cpu = ondatra.cpu.Cpu(.{
-            .ecall = ecall,
-        });
-
-        over: bool = false,
-        cpu: Cpu,
-
-        inline fn ecall(ctx: *anyopaque) bool {
-            const this: *Cpu = @ptrCast(@alignCast(ctx));
-            const state: *@This() = @fieldParentPtr("cpu", this);
-
-            state.over = true;
-
-            return true;
-        }
-    };
-
-    var ram = std.mem.zeroes([std.math.pow(usize, 2, 12)]u8);
-    var state: State = .{
-        .cpu = .init(&ram),
-    };
-
-    state.cpu.loadElf(allocator, PROGRAM) catch |err| {
-        std.debug.print("failed to load the program: {t}\n", .{err});
-
-        return false;
-    };
-
-    std.mem.doNotOptimizeAway(&state);
-    std.mem.doNotOptimizeAway(&state.cpu);
-    std.mem.doNotOptimizeAway(&ram);
-
-    r.begin() catch unreachable;
-
-    while (!state.over) {
-        const step_state = state.cpu.step();
-        std.mem.doNotOptimizeAway(&step_state);
-
-        switch (step_state) {
-            .ok => continue,
-            .exception => |e| {
-                std.debug.print("unexpected exception: {t}\n", .{e.kind});
-
-                return false;
-            },
-        }
-    }
-
-    r.end(state.cpu.registers.instret) catch unreachable;
-
-    return true;
-}
-
-fn floatArithmeticBenchmark(allocator: std.mem.Allocator, r: *Runner) bool {
-    const PROGRAM = @embedFile("float_arithmetic.bin");
-
-    const State = struct {
-        const Cpu = ondatra.cpu.Cpu(.{
-            .ecall = ecall,
-        });
-
-        over: bool = false,
-        cpu: Cpu,
-
-        inline fn ecall(ctx: *anyopaque) bool {
-            const this: *Cpu = @ptrCast(@alignCast(ctx));
-            const state: *@This() = @fieldParentPtr("cpu", this);
-
-            state.over = true;
-
-            return true;
-        }
-    };
-
-    var ram = std.mem.zeroes([std.math.pow(usize, 2, 12)]u8);
-    var state: State = .{
-        .cpu = .init(&ram),
-    };
-
-    state.cpu.loadElf(allocator, PROGRAM) catch |err| {
-        std.debug.print("failed to load the program: {t}\n", .{err});
-
-        return false;
-    };
-
-    std.mem.doNotOptimizeAway(&state);
-    std.mem.doNotOptimizeAway(&state.cpu);
-    std.mem.doNotOptimizeAway(&ram);
-
-    r.begin() catch unreachable;
-
-    while (!state.over) {
-        const step_state = state.cpu.step();
-        std.mem.doNotOptimizeAway(&step_state);
-
-        switch (step_state) {
-            .ok => continue,
-            .exception => |e| {
-                std.debug.print("unexpected exception: {t}\n", .{e.kind});
-
-                return false;
-            },
-        }
-    }
-
-    r.end(state.cpu.registers.instret) catch unreachable;
-
-    return true;
-}
-
-fn floatSqrtFmaBenchmark(allocator: std.mem.Allocator, r: *Runner) bool {
-    const PROGRAM = @embedFile("float_sqrt_fma.bin");
-
-    const State = struct {
-        const Cpu = ondatra.cpu.Cpu(.{
-            .ecall = ecall,
-        });
-
-        over: bool = false,
-        cpu: Cpu,
-
-        inline fn ecall(ctx: *anyopaque) bool {
-            const this: *Cpu = @ptrCast(@alignCast(ctx));
-            const state: *@This() = @fieldParentPtr("cpu", this);
-
-            state.over = true;
-
-            return true;
-        }
-    };
-
-    var ram = std.mem.zeroes([std.math.pow(usize, 2, 12)]u8);
-    var state: State = .{
-        .cpu = .init(&ram),
-    };
-
-    state.cpu.loadElf(allocator, PROGRAM) catch |err| {
-        std.debug.print("failed to load the program: {t}\n", .{err});
-
-        return false;
-    };
-
-    std.mem.doNotOptimizeAway(&state);
-    std.mem.doNotOptimizeAway(&state.cpu);
-    std.mem.doNotOptimizeAway(&ram);
-
-    r.begin() catch unreachable;
-
-    while (!state.over) {
-        const step_state = state.cpu.step();
-        std.mem.doNotOptimizeAway(&step_state);
-
-        switch (step_state) {
-            .ok => continue,
-            .exception => |e| {
-                std.debug.print("unexpected exception: {t}\n", .{e.kind});
-
-                return false;
-            },
-        }
-    }
-
-    r.end(state.cpu.registers.instret) catch unreachable;
-
-    return true;
+    }.func;
 }

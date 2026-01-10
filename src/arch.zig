@@ -135,18 +135,295 @@ pub const FloatHelpers = struct {
     }
 };
 
+pub const PrivilegeLevel = enum(u2) {
+    user = 0b00,
+    // supervisor = 0b01, // Not implemented
+    machine = 0b11,
+    _,
+
+    pub inline fn sanitize(level: PrivilegeLevel) PrivilegeLevel {
+        return switch (level) {
+            .user => .user,
+            .machine => .machine,
+            _ => .machine, // Invalid values default to M-mode
+        };
+    }
+};
+
 pub const Registers = struct {
     pub const Csr = enum(u12) {
+        pub const Error = error{
+            IllegalInstruction, // Privilege violation or invalid CSR
+        };
+
+        // User-level CSRs (0x000-0x0FF)
         fflags = 0x001,
         frm = 0x002,
         fcsr = 0x003,
+        // User Counter/Timers (0xC00-0xC7F) - read-only
         cycle = 0xC00,
         time = 0xC01,
         instret = 0xC02,
         cycleh = 0xC80,
         timeh = 0xC81,
         instreth = 0xC82,
+        // Machine Information (0xF11-0xF14) - read-only
+        mvendorid = 0xF11,
+        marchid = 0xF12,
+        mimpid = 0xF13,
+        mhartid = 0xF14,
+        // Machine Trap Setup (0x300-0x306)
+        mstatus = 0x300,
+        misa = 0x301,
+        mie = 0x304,
+        mtvec = 0x305,
+        mcounteren = 0x306,
+        // Machine Trap Handling (0x340-0x344)
+        mscratch = 0x340,
+        mepc = 0x341,
+        mcause = 0x342,
+        mtval = 0x343,
+        mip = 0x344,
+        // Machine Counter/Timers (0xB00-0xB82)
+        mcycle = 0xB00,
+        minstret = 0xB02,
+        mcycleh = 0xB80,
+        minstreth = 0xB82,
+        // PMP Configuration (0x3A0-0x3A3)
+        pmpcfg0 = 0x3A0,
+        pmpcfg1 = 0x3A1,
+        pmpcfg2 = 0x3A2,
+        pmpcfg3 = 0x3A3,
+        // PMP Address (0x3B0-0x3BF)
+        pmpaddr0 = 0x3B0,
+        pmpaddr1 = 0x3B1,
+        pmpaddr2 = 0x3B2,
+        pmpaddr3 = 0x3B3,
+        pmpaddr4 = 0x3B4,
+        pmpaddr5 = 0x3B5,
+        pmpaddr6 = 0x3B6,
+        pmpaddr7 = 0x3B7,
+        pmpaddr8 = 0x3B8,
+        pmpaddr9 = 0x3B9,
+        pmpaddr10 = 0x3BA,
+        pmpaddr11 = 0x3BB,
+        pmpaddr12 = 0x3BC,
+        pmpaddr13 = 0x3BD,
+        pmpaddr14 = 0x3BE,
+        pmpaddr15 = 0x3BF,
         _,
+
+        pub inline fn getRequiredPrivilege(csr: Csr) PrivilegeLevel {
+            const addr = @intFromEnum(csr);
+            const priv_bits: u2 = @truncate(addr >> 8);
+
+            return switch (priv_bits) {
+                0b00, 0b01 => .user,
+                0b10, 0b11 => .machine,
+            };
+        }
+
+        pub inline fn isReadOnly(csr: Csr) bool {
+            const addr = @intFromEnum(csr);
+            const rw_bits: u2 = @truncate(addr >> 10);
+
+            return rw_bits == 0b11;
+        }
+    };
+
+    pub const Mstatus = packed struct(u32) {
+        _reserved0: u1 = 0,
+        sie: bool = false, // S-mode interrupt enable (not used)
+        _reserved2: u1 = 0,
+        mie: bool = false, // M-mode interrupt enable
+        _reserved4: u1 = 0,
+        spie: bool = false, // S-mode previous interrupt enable (not used)
+        ube: bool = false, // U-mode big-endian
+        mpie: bool = false, // M-mode previous interrupt enable
+        spp: u1 = 0, // S-mode previous privilege (not used)
+        vs: u2 = 0, // Vector extension state
+        mpp: PrivilegeLevel = .machine, // M-mode previous privilege
+        fs: u2 = 0, // Floating-point state
+        xs: u2 = 0, // Extension state
+        mprv: bool = false, // Modify privilege for loads/stores
+        sum: bool = false, // Supervisor User Memory access (not used)
+        mxr: bool = false, // Make executable readable
+        tvm: bool = false, // Trap Virtual Memory (not used)
+        tw: bool = false, // Timeout Wait
+        tsr: bool = false, // Trap SRET (not used)
+        _reserved23_30: u8 = 0,
+        sd: bool = false, // State dirty summary
+
+        // WPRI mask: bits that must preserve value on write
+        pub const WPRI_MASK: u32 = 0x007F_E1E5;
+        // Writable bits mask for M+U system
+        pub const WRITE_MASK: u32 = 0x0000_1888; // MIE, MPIE, MPP
+
+        pub inline fn updateSD(this: *Mstatus) void {
+            this.sd = (this.fs == 0b11) or (this.xs == 0b11) or (this.vs == 0b11);
+        }
+    };
+
+    pub const Mtvec = packed struct(u32) {
+        mode: Mode = .direct,
+        base: u30 = 0,
+
+        pub const Mode = enum(u2) {
+            direct = 0,
+            vectored = 1,
+            _,
+        };
+
+        pub inline fn getAddress(this: Mtvec, cause: u31, is_interrupt: bool) u32 {
+            const base_addr = @as(u32, this.base) << 2;
+
+            return switch (this.mode) {
+                .direct => base_addr,
+                .vectored => if (is_interrupt) base_addr +% (@as(u32, cause) * 4) else base_addr,
+                _ => base_addr,
+            };
+        }
+    };
+
+    pub const Mcause = packed struct(u32) {
+        code: u31 = 0,
+        interrupt: bool = false,
+
+        pub const Exception = enum(u31) {
+            instruction_address_misaligned = 0,
+            instruction_access_fault = 1,
+            illegal_instruction = 2,
+            breakpoint = 3,
+            load_address_misaligned = 4,
+            load_access_fault = 5,
+            store_address_misaligned = 6,
+            store_access_fault = 7,
+            ecall_from_u = 8,
+            ecall_from_m = 11,
+        };
+
+        pub const Interrupt = enum(u31) {
+            machine_software = 3,
+            machine_timer = 7,
+            machine_external = 11,
+        };
+
+        pub inline fn fromException(code: Exception) Mcause {
+            return .{ .code = @intFromEnum(code), .interrupt = false };
+        }
+
+        pub inline fn fromInterrupt(code: Interrupt) Mcause {
+            return .{ .code = @intFromEnum(code), .interrupt = true };
+        }
+    };
+
+    pub const Mie = packed struct(u32) {
+        _reserved0: u3 = 0,
+        msie: bool = false, // M-mode software interrupt enable
+        _reserved4: u3 = 0,
+        mtie: bool = false, // M-mode timer interrupt enable
+        _reserved8: u3 = 0,
+        meie: bool = false, // M-mode external interrupt enable
+        _reserved12: u20 = 0,
+    };
+
+    pub const Mip = packed struct(u32) {
+        _reserved0: u3 = 0,
+        msip: bool = false, // M-mode software interrupt pending
+        _reserved4: u3 = 0,
+        mtip: bool = false, // M-mode timer interrupt pending
+        _reserved8: u3 = 0,
+        meip: bool = false, // M-mode external interrupt pending
+        _reserved12: u20 = 0,
+
+        // Writable bits (MSIP can be written, MTIP/MEIP are external)
+        pub const WRITE_MASK: u32 = 0x00000008;
+    };
+
+    pub const Mcounteren = packed struct(u32) {
+        cy: bool = false, // cycle counter enable for U-mode
+        tm: bool = false, // time counter enable for U-mode
+        ir: bool = false, // instret counter enable for U-mode
+        _reserved: u29 = 0,
+    };
+
+    pub const PmpCfg = packed struct(u8) {
+        r: bool = false, // Read permission
+        w: bool = false, // Write permission
+        x: bool = false, // Execute permission
+        a: AddressMode = .off, // Address matching mode
+        _reserved: u2 = 0,
+        l: bool = false, // Lock bit
+
+        pub const AddressMode = enum(u2) {
+            off = 0, // Disabled
+            tor = 1, // Top of Range
+            na4 = 2, // Naturally aligned 4-byte
+            napot = 3, // Naturally aligned power-of-2
+        };
+
+        pub inline fn isLocked(this: PmpCfg) bool {
+            return this.l;
+        }
+
+        pub inline fn isEnabled(this: PmpCfg) bool {
+            return this.a != .off;
+        }
+    };
+
+    pub const Pmp = struct {
+        pub const NUM_REGIONS: usize = 16;
+
+        pub const AccessType = enum { read, write, execute };
+
+        pub const MatchResult = enum {
+            no_match,
+            match_allowed,
+            match_denied,
+        };
+
+        pub inline fn getRange(cfg: PmpCfg, addr: u32, prev_addr: u32) struct { start: u34, end: u34 } {
+            return switch (cfg.a) {
+                .off => .{ .start = 0, .end = 0 },
+                .tor => .{
+                    .start = @as(u34, prev_addr) << 2,
+                    .end = @as(u34, addr) << 2,
+                },
+                .na4 => .{
+                    .start = @as(u34, addr) << 2,
+                    .end = (@as(u34, addr) << 2) + 4,
+                },
+                .napot => blk: {
+                    // Find the lowest zero bit to determine range size
+                    const trailing_ones = @ctz(~addr);
+                    const range_size: u34 = @as(u34, 8) << trailing_ones;
+                    const base = (@as(u34, addr) & ~(range_size / 4 - 1)) << 2;
+
+                    break :blk .{ .start = base, .end = base + range_size };
+                },
+            };
+        }
+
+        pub inline fn checkAccess(cfg: PmpCfg, addr: u32, prev_addr: u32, access_addr: u32, access_type: AccessType) MatchResult {
+            if (cfg.a == .off) {
+                return .no_match;
+            }
+
+            const range = getRange(cfg, addr, prev_addr);
+            const check_addr: u34 = access_addr;
+
+            if (check_addr >= range.start and check_addr < range.end) {
+                const allowed = switch (access_type) {
+                    .read => cfg.r,
+                    .write => cfg.w,
+                    .execute => cfg.x,
+                };
+
+                return if (allowed) .match_allowed else .match_denied;
+            }
+
+            return .no_match;
+        }
     };
 
     pub const Fcsr = packed struct(u32) {
@@ -205,6 +482,35 @@ pub const Registers = struct {
     cycle: u64 = 0,
     instret: u64 = 0,
     pc: u32 = 0,
+    privilege: PrivilegeLevel = .machine,
+    mstatus: Mstatus = .{},
+    mie: Mie = .{},
+    mtvec: Mtvec = .{},
+    mscratch: u32 = 0,
+    mepc: u32 = 0,
+    mcause: Mcause = .{},
+    mtval: u32 = 0,
+    mip: Mip = .{},
+    mcounteren: Mcounteren = .{},
+    pmpcfg: [4]u32 = std.mem.zeroes([4]u32),
+    pmpaddr: [Pmp.NUM_REGIONS]u32 = std.mem.zeroes([Pmp.NUM_REGIONS]u32),
+    mvendorid: u32 = 0,
+    marchid: u32 = 0,
+    mimpid: u32 = 0x0001_0000,
+    mhartid: u32 = 0,
+
+    pub const MISA_VALUE: u32 = blk: {
+        const mxl: u32 = 0b01 << 30; // XLEN = 32
+        const i: u32 = 1 << 8; // Base integer ISA
+        const m: u32 = 1 << 12; // Integer multiply/divide
+        const a: u32 = 0 << 0; // Atomic
+        const f: u32 = 1 << 5; // Single-precision float
+        const d: u32 = 1 << 3; // Double-precision float
+        const c: u32 = 0 << 2; // Compressed
+        const u: u32 = 1 << 20; // User mode
+
+        break :blk mxl | i | m | a | f | d | c | u;
+    };
 
     pub inline fn get(this: *Registers, n: u8) i32 {
         if (n == 0) {
@@ -245,32 +551,348 @@ pub const Registers = struct {
         this.float[n] = @bitCast(value);
     }
 
-    pub inline fn readCsr(this: *Registers, csr: Csr) u32 {
+    pub inline fn canAccessCsr(this: *Registers, csr: Csr) bool {
+        const required = csr.getRequiredPrivilege();
+
+        return @intFromEnum(this.privilege) >= @intFromEnum(required);
+    }
+
+    inline fn canAccessCounter(this: *Registers, csr: Csr) bool {
+        if (this.privilege == .machine) return true;
+
         return switch (csr) {
-            .fflags => @as(u32, this.fcsr.getFflags()),
-            .frm => @as(u32, @intFromEnum(this.fcsr.frm)),
-            .fcsr => @as(u32, @bitCast(this.fcsr)) & 0xFF,
-            .cycle => @truncate(this.cycle),
-            .cycleh => @truncate(this.cycle >> 32),
-            .time => @truncate(this.cycle),
-            .timeh => @truncate(this.cycle >> 32),
-            .instret => @truncate(this.instret),
-            .instreth => @truncate(this.instret >> 32),
-            else => 0,
+            .cycle, .cycleh => this.mcounteren.cy,
+            .time, .timeh => this.mcounteren.tm,
+            .instret, .instreth => this.mcounteren.ir,
+            else => true,
         };
     }
 
-    pub inline fn writeCsr(this: *Registers, csr: Csr, value: u32) void {
+    pub inline fn getPmpCfg(this: *Registers, index: usize) PmpCfg {
+        std.debug.assert(index < Pmp.NUM_REGIONS);
+
+        const cfg_reg = index / 4;
+        const cfg_offset: u5 = @intCast((index % 4) * 8);
+
+        return @bitCast(@as(u8, @truncate(this.pmpcfg[cfg_reg] >> cfg_offset)));
+    }
+
+    pub inline fn setPmpCfg(this: *Registers, index: usize, cfg: PmpCfg) void {
+        std.debug.assert(index < Pmp.NUM_REGIONS);
+
+        const current = this.getPmpCfg(index);
+
+        if (current.isLocked()) {
+            return;
+        }
+
+        const cfg_reg = index / 4;
+        const cfg_offset: u5 = @intCast((index % 4) * 8);
+        const mask: u32 = @as(u32, 0xFF) << cfg_offset;
+
+        this.pmpcfg[cfg_reg] = (this.pmpcfg[cfg_reg] & ~mask) | (@as(u8, @bitCast(cfg)) << cfg_offset);
+    }
+
+    pub inline fn checkPmpAccess(this: *Registers, addr: u32, access_type: Pmp.AccessType) bool {
+        const priv = this.privilege.sanitize();
+
+        // M-mode without MPRV bypasses PMP unless L bit is set
+        if (priv == .machine and !this.mstatus.mprv) {
+            // Still check locked entries
+            var matched_locked = false;
+            var prev_addr: u32 = 0;
+
+            inline for (0..Pmp.NUM_REGIONS) |i| {
+                const cfg = this.getPmpCfg(i);
+                const pmpaddr = this.pmpaddr[i];
+
+                if (cfg.isLocked()) {
+                    const result = Pmp.checkAccess(cfg, pmpaddr, prev_addr, addr, access_type);
+
+                    if (result == .match_denied) {
+                        return false;
+                    }
+
+                    if (result == .match_allowed) {
+                        matched_locked = true;
+                    }
+                }
+
+                prev_addr = pmpaddr;
+            }
+
+            return true;
+        }
+
+        // U-mode or M-mode with MPRV must pass PMP check
+        var prev_addr: u32 = 0;
+
+        inline for (0..Pmp.NUM_REGIONS) |i| {
+            const cfg = this.getPmpCfg(i);
+            const pmpaddr = this.pmpaddr[i];
+
+            const result = Pmp.checkAccess(cfg, pmpaddr, prev_addr, addr, access_type);
+
+            switch (result) {
+                .match_allowed => return true,
+                .match_denied => return false,
+                .no_match => {},
+            }
+
+            prev_addr = pmpaddr;
+        }
+
+        // No PMP entry matched - denied for U-mode, allowed for M-mode
+        return priv == .machine;
+    }
+
+    pub inline fn readCsr(this: *Registers, csr: Csr) Csr.Error!u32 {
+        if (!this.canAccessCsr(csr)) {
+            return Csr.Error.IllegalInstruction;
+        }
+
+        if (!this.canAccessCounter(csr)) {
+            return Csr.Error.IllegalInstruction;
+        }
+
+        return switch (csr) {
+            // User floating-point CSRs
+            .fflags => @as(u32, this.fcsr.getFflags()),
+            .frm => @as(u32, @intFromEnum(this.fcsr.frm)),
+            .fcsr => @as(u32, @bitCast(this.fcsr)) & 0xFF,
+            // User counters (also accessible from M-mode)
+            .cycle, .time => @truncate(this.cycle),
+            .cycleh, .timeh => @truncate(this.cycle >> 32),
+            .instret => @truncate(this.instret),
+            .instreth => @truncate(this.instret >> 32),
+            // Machine information (read-only)
+            .mvendorid => this.mvendorid,
+            .marchid => this.marchid,
+            .mimpid => this.mimpid,
+            .mhartid => this.mhartid,
+            .misa => MISA_VALUE,
+            // Machine trap setup
+            .mstatus => @bitCast(this.mstatus),
+            .mie => @bitCast(this.mie),
+            .mtvec => @bitCast(this.mtvec),
+            .mcounteren => @bitCast(this.mcounteren),
+            // Machine trap handling
+            .mscratch => this.mscratch,
+            .mepc => this.mepc,
+            .mcause => @bitCast(this.mcause),
+            .mtval => this.mtval,
+            .mip => @bitCast(this.mip),
+            // Machine counters
+            .mcycle => @truncate(this.cycle),
+            .mcycleh => @truncate(this.cycle >> 32),
+            .minstret => @truncate(this.instret),
+            .minstreth => @truncate(this.instret >> 32),
+            // PMP configuration
+            .pmpcfg0 => this.pmpcfg[0],
+            .pmpcfg1 => this.pmpcfg[1],
+            .pmpcfg2 => this.pmpcfg[2],
+            .pmpcfg3 => this.pmpcfg[3],
+            // PMP addresses
+            .pmpaddr0 => this.pmpaddr[0],
+            .pmpaddr1 => this.pmpaddr[1],
+            .pmpaddr2 => this.pmpaddr[2],
+            .pmpaddr3 => this.pmpaddr[3],
+            .pmpaddr4 => this.pmpaddr[4],
+            .pmpaddr5 => this.pmpaddr[5],
+            .pmpaddr6 => this.pmpaddr[6],
+            .pmpaddr7 => this.pmpaddr[7],
+            .pmpaddr8 => this.pmpaddr[8],
+            .pmpaddr9 => this.pmpaddr[9],
+            .pmpaddr10 => this.pmpaddr[10],
+            .pmpaddr11 => this.pmpaddr[11],
+            .pmpaddr12 => this.pmpaddr[12],
+            .pmpaddr13 => this.pmpaddr[13],
+            .pmpaddr14 => this.pmpaddr[14],
+            .pmpaddr15 => this.pmpaddr[15],
+            else => 0, // Unknown CSR reads as 0
+        };
+    }
+
+    pub inline fn writeCsr(this: *Registers, csr: Csr, value: u32) Csr.Error!void {
+        if (!this.canAccessCsr(csr)) {
+            return Csr.Error.IllegalInstruction;
+        }
+
+        if (csr.isReadOnly()) {
+            return Csr.Error.IllegalInstruction;
+        }
+
         switch (csr) {
+            // User floating-point CSRs
             .fflags => this.fcsr.setFflags(@truncate(value)),
             .frm => this.fcsr.frm = @enumFromInt(@as(u3, @truncate(value))),
             .fcsr => {
                 const masked = value & 0xFF;
                 this.fcsr = @bitCast(masked);
             },
-            // cycle/time/instret are read-only in unprivileged mode
+            // Machine trap setup
+            .mstatus => {
+                const mpp_bits: u2 = @truncate(value >> 11);
+                const valid_mpp: u2 = switch (mpp_bits) {
+                    @intFromEnum(PrivilegeLevel.user) => @intFromEnum(PrivilegeLevel.user),
+                    @intFromEnum(PrivilegeLevel.machine) => @intFromEnum(PrivilegeLevel.machine),
+                    else => @intFromEnum(PrivilegeLevel.machine), // Default to M-mode for invalid values
+                };
+
+                const sanitized_value = (value & ~@as(u32, 0x1800)) | (@as(u32, valid_mpp) << 11);
+
+                // Apply write mask
+                const current: u32 = @bitCast(this.mstatus);
+                const new_val = (current & ~Mstatus.WRITE_MASK) | (sanitized_value & Mstatus.WRITE_MASK);
+
+                this.mstatus = @bitCast(new_val);
+                this.mstatus.updateSD();
+            },
+            .mie => this.mie = @bitCast(value & 0x888), // Only valid bits
+            .mtvec => {
+                var new_tvec: Mtvec = @bitCast(value);
+
+                // Validate mode
+                if (@intFromEnum(new_tvec.mode) > 1) {
+                    new_tvec.mode = .direct;
+                }
+
+                this.mtvec = new_tvec;
+            },
+            .mcounteren => this.mcounteren = @bitCast(value & 0x7),
+            // Machine trap handling
+            .mscratch => this.mscratch = value,
+            .mepc => this.mepc = value & ~@as(u32, 0x3), // Align to 4 bytes
+            .mcause => this.mcause = @bitCast(value),
+            .mtval => this.mtval = value,
+            .mip => {
+                // Only MSIP is writable
+                const current: u32 = @bitCast(this.mip);
+
+                this.mip = @bitCast((current & ~Mip.WRITE_MASK) | (value & Mip.WRITE_MASK));
+            },
+            // Machine counters (writable in M-mode)
+            .mcycle => this.cycle = (this.cycle & 0xFFFFFFFF_00000000) | value,
+            .mcycleh => this.cycle = (this.cycle & 0x00000000_FFFFFFFF) | (@as(u64, value) << 32),
+            .minstret => this.instret = (this.instret & 0xFFFFFFFF_00000000) | value,
+            .minstreth => this.instret = (this.instret & 0x00000000_FFFFFFFF) | (@as(u64, value) << 32),
+            // PMP configuration (respects lock bits)
+            .pmpcfg0 => this.writePmpcfg(0, value),
+            .pmpcfg1 => this.writePmpcfg(1, value),
+            .pmpcfg2 => this.writePmpcfg(2, value),
+            .pmpcfg3 => this.writePmpcfg(3, value),
+            // PMP addresses (respects lock bits)
+            .pmpaddr0 => this.writePmpaddr(0, value),
+            .pmpaddr1 => this.writePmpaddr(1, value),
+            .pmpaddr2 => this.writePmpaddr(2, value),
+            .pmpaddr3 => this.writePmpaddr(3, value),
+            .pmpaddr4 => this.writePmpaddr(4, value),
+            .pmpaddr5 => this.writePmpaddr(5, value),
+            .pmpaddr6 => this.writePmpaddr(6, value),
+            .pmpaddr7 => this.writePmpaddr(7, value),
+            .pmpaddr8 => this.writePmpaddr(8, value),
+            .pmpaddr9 => this.writePmpaddr(9, value),
+            .pmpaddr10 => this.writePmpaddr(10, value),
+            .pmpaddr11 => this.writePmpaddr(11, value),
+            .pmpaddr12 => this.writePmpaddr(12, value),
+            .pmpaddr13 => this.writePmpaddr(13, value),
+            .pmpaddr14 => this.writePmpaddr(14, value),
+            .pmpaddr15 => this.writePmpaddr(15, value),
+            // Read-only or user counters - ignore writes
             else => {},
         }
+    }
+
+    pub inline fn readCsrUnchecked(this: *Registers, csr: Csr) u32 {
+        return switch (csr) {
+            .fflags => @as(u32, this.fcsr.getFflags()),
+            .frm => @as(u32, @intFromEnum(this.fcsr.frm)),
+            .fcsr => @as(u32, @bitCast(this.fcsr)) & 0xFF,
+            .cycle, .time => @truncate(this.cycle),
+            .cycleh, .timeh => @truncate(this.cycle >> 32),
+            .instret => @truncate(this.instret),
+            .instreth => @truncate(this.instret >> 32),
+            .mstatus => @bitCast(this.mstatus),
+            .mie => @bitCast(this.mie),
+            .mtvec => @bitCast(this.mtvec),
+            .mcounteren => @bitCast(this.mcounteren),
+            .mscratch => this.mscratch,
+            .mepc => this.mepc,
+            .mcause => @bitCast(this.mcause),
+            .mtval => this.mtval,
+            .mip => @bitCast(this.mip),
+            .mcycle => @truncate(this.cycle),
+            .mcycleh => @truncate(this.cycle >> 32),
+            .minstret => @truncate(this.instret),
+            .minstreth => @truncate(this.instret >> 32),
+            else => 0,
+        };
+    }
+
+    pub inline fn writeCsrUnchecked(this: *Registers, csr: Csr, value: u32) void {
+        switch (csr) {
+            .fflags => this.fcsr.setFflags(@truncate(value)),
+            .frm => this.fcsr.frm = @enumFromInt(@as(u3, @truncate(value))),
+            .fcsr => this.fcsr = @bitCast(value & 0xFF),
+            .mstatus => {
+                const new_val = (@as(u32, @bitCast(this.mstatus)) & ~Mstatus.WRITE_MASK) |
+                    (value & Mstatus.WRITE_MASK);
+                this.mstatus = @bitCast(new_val);
+            },
+            .mie => this.mie = @bitCast(value & 0x888),
+            .mtvec => this.mtvec = @bitCast(value),
+            .mcounteren => this.mcounteren = @bitCast(value & 0x7),
+            .mscratch => this.mscratch = value,
+            .mepc => this.mepc = value & ~@as(u32, 0x3),
+            .mcause => this.mcause = @bitCast(value),
+            .mtval => this.mtval = value,
+            .mip => {
+                const current: u32 = @bitCast(this.mip);
+                this.mip = @bitCast((current & ~Mip.WRITE_MASK) | (value & Mip.WRITE_MASK));
+            },
+            .mcycle => this.cycle = (this.cycle & 0xFFFFFFFF_00000000) | value,
+            .mcycleh => this.cycle = (this.cycle & 0x00000000_FFFFFFFF) | (@as(u64, value) << 32),
+            .minstret => this.instret = (this.instret & 0xFFFFFFFF_00000000) | value,
+            .minstreth => this.instret = (this.instret & 0x00000000_FFFFFFFF) | (@as(u64, value) << 32),
+            else => {},
+        }
+    }
+
+    pub inline fn writePmpcfg(this: *Registers, index: usize, value: u32) void {
+        var result: u32 = 0;
+
+        for (0..4) |i| {
+            const entry_idx = index * 4 + i;
+            const current_cfg = this.getPmpCfg(entry_idx);
+            const new_cfg: PmpCfg = @bitCast(@as(u8, @truncate(value >> @intCast(i * 8))));
+
+            if (!current_cfg.isLocked()) {
+                result |= @as(u8, @bitCast(new_cfg)) << @intCast(i * 8);
+            } else {
+                result |= @as(u8, @bitCast(current_cfg)) << @intCast(i * 8);
+            }
+        }
+
+        this.pmpcfg[index] = result;
+    }
+
+    pub inline fn writePmpaddr(this: *Registers, index: usize, value: u32) void {
+        const cfg = this.getPmpCfg(index);
+
+        if (cfg.isLocked()) {
+            return;
+        }
+
+        // Also check if next entry is locked and uses TOR mode
+        if (index < Pmp.NUM_REGIONS - 1) {
+            const next_cfg = this.getPmpCfg(index + 1);
+
+            if (next_cfg.isLocked() and next_cfg.a == .tor) {
+                return;
+            }
+        }
+
+        this.pmpaddr[index] = value;
     }
 
     pub inline fn getAbiName(n: u8) []const u8 {
@@ -391,9 +1013,9 @@ pub const Instruction = union(enum) {
     sra: struct { rd: u8, rs1: u8, rs2: u8 },
     @"or": struct { rd: u8, rs1: u8, rs2: u8 },
     @"and": struct { rd: u8, rs1: u8, rs2: u8 },
-    fence: struct {},
-    ecall: struct {},
-    ebreak: struct {},
+    fence: void,
+    ecall: void,
+    ebreak: void,
     // RV32M
     mul: struct { rd: u8, rs1: u8, rs2: u8 },
     mulh: struct { rd: u8, rs1: u8, rs2: u8 },
@@ -465,7 +1087,7 @@ pub const Instruction = union(enum) {
     csrrsi: struct { rd: u8, uimm: u5, csr: u12 },
     csrrci: struct { rd: u8, uimm: u5, csr: u12 },
     // Zifencei
-    fence_i: struct {},
+    fence_i: void,
     // Zba
     sh1add: struct { rd: u8, rs1: u8, rs2: u8 },
     sh2add: struct { rd: u8, rs1: u8, rs2: u8 },
@@ -489,6 +1111,9 @@ pub const Instruction = union(enum) {
     rori: struct { rd: u8, rs1: u8, shamt: u5 },
     orc_b: struct { rd: u8, rs1: u8 },
     rev8: struct { rd: u8, rs1: u8 },
+    // Privileged
+    mret: void,
+    wfi: void,
 
     inline fn decodeOpcode(from: u32) u7 {
         return @truncate(from);
@@ -1126,14 +1751,16 @@ pub const Instruction = union(enum) {
                 },
             },
             0b0001111 => switch (funct3) {
-                0b000 => .{ .fence = .{} },
-                0b001 => .{ .fence_i = .{} },
+                0b000 => .{ .fence = {} },
+                0b001 => .{ .fence_i = {} },
                 else => DecodeError.UnknownInstruction,
             },
             0b1110011 => switch (funct3) {
                 0b000 => switch (decodeRs2(from)) {
-                    0b00000 => .{ .ecall = .{} },
-                    0b00001 => .{ .ebreak = .{} },
+                    0b00000 => .{ .ecall = {} },
+                    0b00001 => .{ .ebreak = {} },
+                    0b00010 => .{ .mret = {} },
+                    0b00101 => .{ .wfi = {} },
                     else => DecodeError.UnknownInstruction,
                 },
                 0b001 => .{
@@ -1622,7 +2249,7 @@ pub const Instruction = union(enum) {
         };
     }
 
-    pub fn encode(this: Instruction) u32 {
+    pub inline fn encode(this: Instruction) u32 {
         return switch (this) {
             .lui => |i| encodeOpcode(0b0110111) |
                 encodeRd(i.rd) |
@@ -2326,10 +2953,16 @@ pub const Instruction = union(enum) {
                 encodeFunct3(0b101) |
                 encodeRs1(i.rs1) |
                 encodeCsr(0x698),
+            .mret => encodeOpcode(0b1110011) |
+                encodeFunct7(0b0011000) |
+                encodeRs2(0b00010),
+            .wfi => encodeOpcode(0b1110011) |
+                encodeFunct7(0b0001000) |
+                encodeRs2(0b00101),
         };
     }
 
-    pub fn format(this: Instruction, writer: anytype) !void {
+    pub inline fn format(this: Instruction, writer: anytype) !void {
         switch (this) {
             .lui => |i| try writer.print("lui {s}, {d}", .{ Registers.getAbiName(i.rd), i.imm }),
             .auipc => |i| try writer.print("auipc {s}, {d}", .{ Registers.getAbiName(i.rd), i.imm }),
@@ -2459,6 +3092,8 @@ pub const Instruction = union(enum) {
             .rori => |i| try writer.print("rori {s}, {s}, {d}", .{ Registers.getAbiName(i.rd), Registers.getAbiName(i.rs1), i.shamt }),
             .orc_b => |i| try writer.print("orc.b {s}, {s}", .{ Registers.getAbiName(i.rd), Registers.getAbiName(i.rs1) }),
             .rev8 => |i| try writer.print("rev8 {s}, {s}", .{ Registers.getAbiName(i.rd), Registers.getAbiName(i.rs1) }),
+            .mret => try writer.print("mret", .{}),
+            .wfi => try writer.print("wfi", .{}),
         }
     }
 };
@@ -2991,7 +3626,7 @@ test "Instruction remu encode & decode" {
 }
 
 test "Instruction fence encode & decode" {
-    const expected: Instruction = .{ .fence = .{} };
+    const expected: Instruction = .{ .fence = {} };
 
     const raw: u32 = expected.encode();
     const actual: Instruction = try Instruction.decode(raw);
@@ -3001,7 +3636,7 @@ test "Instruction fence encode & decode" {
 }
 
 test "Instruction ecall encode & decode" {
-    const expected: Instruction = .{ .ecall = .{} };
+    const expected: Instruction = .{ .ecall = {} };
 
     const raw: u32 = expected.encode();
     const actual: Instruction = try Instruction.decode(raw);
@@ -3011,7 +3646,7 @@ test "Instruction ecall encode & decode" {
 }
 
 test "Instruction ebreak encode & decode" {
-    const expected: Instruction = .{ .ebreak = .{} };
+    const expected: Instruction = .{ .ebreak = {} };
 
     const raw: u32 = expected.encode();
     const actual: Instruction = try Instruction.decode(raw);
@@ -4281,7 +4916,7 @@ test "Instruction csrrci all zero values encode & decode" {
 }
 
 test "Instruction fence_i encode & decode" {
-    const expected: Instruction = .{ .fence_i = .{} };
+    const expected: Instruction = .{ .fence_i = {} };
 
     const raw: u32 = expected.encode();
     const actual: Instruction = try Instruction.decode(raw);
@@ -4738,4 +5373,45 @@ test "Instruction csrrs read instret encode & decode" {
 
     try std.testing.expectEqual(expected, actual);
     try std.testing.expectEqual(raw, actual.encode());
+}
+
+test "mret encode and decode" {
+    const expected: Instruction = .mret;
+    const raw: u32 = expected.encode();
+    const actual = try Instruction.decode(raw);
+
+    try std.testing.expectEqual(expected, actual);
+    try std.testing.expectEqual(raw, actual.encode());
+}
+
+test "wfi encode and decode" {
+    const expected: Instruction = .wfi;
+    const raw: u32 = expected.encode();
+    const actual = try Instruction.decode(raw);
+
+    try std.testing.expectEqual(expected, actual);
+    try std.testing.expectEqual(raw, actual.encode());
+}
+
+test "mstatus write preserves WPRI fields" {
+    var regs = Registers{};
+    regs.privilege = .machine;
+
+    // Write with garbage in reserved fields
+    try regs.writeCsr(.mstatus, 0xFFFFFFFF);
+
+    const val: u32 = try regs.readCsr(.mstatus);
+    // Only MIE, MPIE, MPP should be writable
+    try std.testing.expectEqual(@as(u32, 0x1888), val & 0x1FFF);
+}
+
+test "mstatus.mpp only accepts valid privilege levels" {
+    var regs = Registers{};
+    regs.privilege = .machine;
+
+    // Try to set MPP to invalid value (supervisor = 01)
+    try regs.writeCsr(.mstatus, 0x800); // MPP = 01
+
+    // Should default to machine mode
+    try std.testing.expectEqual(PrivilegeLevel.machine, regs.mstatus.mpp);
 }
