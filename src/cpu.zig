@@ -5734,3 +5734,135 @@ test "x0 remains zero after all instruction types" {
     try std.testing.expectEqual(TestCpu.State.ok, cpu.run(6));
     try std.testing.expectEqual(@as(i32, 0), cpu.registers.get(0));
 }
+
+test "time CSR mirrors cycle CSR" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.time) } },
+        .{ .csrrs = .{ .rd = 2, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.cycle = 0xDEADBEEF;
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xDEADBEEF))), cpu.registers.get(1));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xDEADBEF0))), cpu.registers.get(2));
+}
+
+test "timeh CSR mirrors cycleh CSR" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.timeh) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.cycle = 0xCAFEBABE_12345678;
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xCAFEBABE))), cpu.registers.get(1));
+}
+
+test "cycle and instret counters are read-only via CSR write" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrw = .{ .rd = 0, .rs1 = 1, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
+        .{ .csrrw = .{ .rd = 0, .rs1 = 1, .csr = @intFromEnum(arch.Registers.Csr.instret) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.cycle = 100;
+    cpu.registers.instret = 200;
+    cpu.registers.set(1, @bitCast(@as(u32, 0xFFFFFFFF)));
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+
+    try std.testing.expectEqual(@as(u64, 102), cpu.registers.cycle);
+    try std.testing.expectEqual(@as(u64, 202), cpu.registers.instret);
+}
+
+test "cycle increments on each instruction" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 1 } },
+        .{ .addi = .{ .rd = 2, .rs1 = 0, .imm = 2 } },
+        .{ .addi = .{ .rd = 3, .rs1 = 0, .imm = 3 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+
+    try std.testing.expectEqual(@as(u64, 0), cpu.registers.cycle);
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(u64, 1), cpu.registers.cycle);
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(u64, 2), cpu.registers.cycle);
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(u64, 3), cpu.registers.cycle);
+}
+
+test "instret increments on each retired instruction" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .add = .{ .rd = 1, .rs1 = 0, .rs2 = 0 } },
+        .{ .add = .{ .rd = 2, .rs1 = 0, .rs2 = 0 } },
+        .{ .add = .{ .rd = 3, .rs1 = 0, .rs2 = 0 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+
+    try std.testing.expectEqual(@as(u64, 0), cpu.registers.instret);
+
+    _ = cpu.run(3);
+
+    try std.testing.expectEqual(@as(u64, 3), cpu.registers.instret);
+}
+
+test "cycle overflow from 32-bit to 64-bit boundary" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .addi = .{ .rd = 0, .rs1 = 0, .imm = 0 } },
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
+        .{ .csrrs = .{ .rd = 2, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.cycleh) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.cycle = 0xFFFFFFFF;
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step()); // cycle: 0xFFFFFFFF -> 0x100000000
+    try std.testing.expectEqual(@as(u64, 0x100000000), cpu.registers.cycle);
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(i32, 0), cpu.registers.get(1));
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(i32, 1), cpu.registers.get(2));
+}
+
+test "instret overflow from 32-bit to 64-bit boundary" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .addi = .{ .rd = 0, .rs1 = 0, .imm = 0 } },
+        .{ .csrrs = .{ .rd = 1, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.instret) } },
+        .{ .csrrs = .{ .rd = 2, .rs1 = 0, .csr = @intFromEnum(arch.Registers.Csr.instreth) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.instret = 0xFFFFFFFF;
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step()); // instret: 0xFFFFFFFF -> 0x100000000
+    try std.testing.expectEqual(@as(u64, 0x100000000), cpu.registers.instret);
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(i32, 0), cpu.registers.get(1));
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(@as(i32, 1), cpu.registers.get(2));
+}
+
+test "csrrsi and csrrci cannot modify read-only counters" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .csrrsi = .{ .rd = 1, .uimm = 0x1F, .csr = @intFromEnum(arch.Registers.Csr.cycle) } },
+        .{ .csrrci = .{ .rd = 2, .uimm = 0x1F, .csr = @intFromEnum(arch.Registers.Csr.instret) } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.cycle = 1000;
+    cpu.registers.instret = 2000;
+
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+    try std.testing.expectEqual(TestCpu.State.ok, cpu.step());
+
+    try std.testing.expectEqual(@as(u64, 1002), cpu.registers.cycle);
+    try std.testing.expectEqual(@as(u64, 2002), cpu.registers.instret);
+}
