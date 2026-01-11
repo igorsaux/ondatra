@@ -218,8 +218,8 @@ pub const Registers = struct {
             const priv_bits: u2 = @truncate(addr >> 8);
 
             return switch (priv_bits) {
-                0b00, 0b01 => .user,
-                0b10, 0b11 => .machine,
+                0b00 => .user,
+                0b01, 0b10, 0b11 => .machine,
             };
         }
 
@@ -257,7 +257,7 @@ pub const Registers = struct {
         // WPRI mask: bits that must preserve value on write
         pub const WPRI_MASK: u32 = 0x007F_E1E5;
         // Writable bits mask for M+U system
-        pub const WRITE_MASK: u32 = 0x0000_1888; // MIE, MPIE, MPP
+        pub const WRITE_MASK: u32 = 0x0000_7888; // MIE, MPIE, MPP, FS
 
         pub inline fn updateSD(this: *Mstatus) void {
             this.sd = (this.fs == 0b11) or (this.xs == 0b11) or (this.vs == 0b11);
@@ -532,7 +532,7 @@ pub const Registers = struct {
         const bits = this.float[n];
 
         if ((bits >> 32) != 0xFFFFFFFF) {
-            return std.math.nan(f32);
+            return FloatHelpers.canonicalNanF32();
         }
 
         return @bitCast(@as(u32, @truncate(bits)));
@@ -594,8 +594,13 @@ pub const Registers = struct {
     }
 
     pub inline fn checkPmpAccess(this: *Registers, addr: u32, access_type: Pmp.AccessType, priv: PrivilegeLevel) bool {
+        const effective_priv: PrivilegeLevel = if (priv == .machine and this.mstatus.mprv)
+            this.mstatus.mpp.sanitize()
+        else
+            priv;
+
         // M-mode without MPRV bypasses PMP unless L bit is set
-        if (priv == .machine and !this.mstatus.mprv) {
+        if (effective_priv == .machine and !this.mstatus.mprv) {
             // Still check locked entries
             var matched_locked = false;
             var prev_addr: u32 = 0;
@@ -659,8 +664,10 @@ pub const Registers = struct {
             .frm => @as(u32, @intFromEnum(this.fcsr.frm)),
             .fcsr => @as(u32, @bitCast(this.fcsr)) & 0xFF,
             // User counters (also accessible from M-mode)
-            .cycle, .time => @truncate(this.cycle),
-            .cycleh, .timeh => @truncate(this.cycle >> 32),
+            .cycle => @truncate(this.cycle),
+            .time => @truncate(this.mtime),
+            .cycleh => @truncate(this.cycle >> 32),
+            .timeh => @truncate(this.mtime >> 32),
             .instret => @truncate(this.instret),
             .instreth => @truncate(this.instret >> 32),
             // Machine information (read-only)
@@ -1756,11 +1763,14 @@ pub const Instruction = union(enum) {
                 else => DecodeError.UnknownInstruction,
             },
             0b1110011 => switch (funct3) {
-                0b000 => switch (decodeRs2(from)) {
-                    0b00000 => .{ .ecall = {} },
-                    0b00001 => .{ .ebreak = {} },
-                    0b00010 => .{ .mret = {} },
-                    0b00101 => .{ .wfi = {} },
+                0b000 => switch (funct7) {
+                    0b0000000 => switch (decodeRs2(from)) {
+                        0b00000 => .{ .ecall = {} },
+                        0b00001 => .{ .ebreak = {} },
+                        else => DecodeError.UnknownInstruction,
+                    },
+                    0b0011000 => if (decodeRs2(from) == 0b00010) .{ .mret = {} } else DecodeError.UnknownInstruction,
+                    0b0001000 => if (decodeRs2(from) == 0b00101) .{ .wfi = {} } else DecodeError.UnknownInstruction,
                     else => DecodeError.UnknownInstruction,
                 },
                 0b001 => .{
@@ -1958,13 +1968,13 @@ pub const Instruction = union(enum) {
                         .rm = funct3,
                     },
                 },
-                0b0101100 => .{
+                0b0101100 => if (decodeRs2(from) == 0) .{
                     .fsqrt_s = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
                         .rm = funct3,
                     },
-                },
+                } else DecodeError.UnknownInstruction,
                 0b0010000 => switch (funct3) {
                     0b000 => .{
                         .fsgnj_s = .{
@@ -2023,7 +2033,7 @@ pub const Instruction = union(enum) {
                     },
                     else => DecodeError.UnknownInstruction,
                 },
-                0b1110000 => switch (funct3) {
+                0b1110000 => if (decodeRs2(from) == 0) switch (funct3) {
                     0b000 => .{
                         .fmv_x_w = .{
                             .rd = decodeRd(from),
@@ -2037,7 +2047,7 @@ pub const Instruction = union(enum) {
                         },
                     },
                     else => DecodeError.UnknownInstruction,
-                },
+                } else DecodeError.UnknownInstruction,
                 0b1010000 => switch (funct3) {
                     0b010 => .{
                         .feq_s = .{
@@ -2079,12 +2089,12 @@ pub const Instruction = union(enum) {
                     },
                     else => DecodeError.UnknownInstruction,
                 },
-                0b1111000 => .{
+                0b1111000 => if (decodeRs2(from) == 0 and funct3 == 0b000) .{
                     .fmv_w_x = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
                     },
-                },
+                } else DecodeError.UnknownInstruction,
                 0b0000001 => .{
                     .fadd_d = .{
                         .rd = decodeRd(from),
@@ -2117,13 +2127,13 @@ pub const Instruction = union(enum) {
                         .rm = funct3,
                     },
                 },
-                0b0101101 => .{
+                0b0101101 => if (decodeRs2(from) == 0) .{
                     .fsqrt_d = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
                         .rm = funct3,
                     },
-                },
+                } else DecodeError.UnknownInstruction,
                 0b0010001 => switch (funct3) {
                     0b000 => .{
                         .fsgnj_d = .{
@@ -2165,20 +2175,20 @@ pub const Instruction = union(enum) {
                     },
                     else => DecodeError.UnknownInstruction,
                 },
-                0b0100000 => .{
+                0b0100000 => if (decodeRs2(from) == 0b00001) .{
                     .fcvt_s_d = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
                         .rm = funct3,
                     },
-                },
-                0b0100001 => .{
+                } else DecodeError.UnknownInstruction,
+                0b0100001 => if (decodeRs2(from) == 0b00000) .{
                     .fcvt_d_s = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
                         .rm = funct3,
                     },
-                },
+                } else DecodeError.UnknownInstruction,
                 0b1010001 => switch (funct3) {
                     0b010 => .{
                         .feq_d = .{
@@ -2203,12 +2213,12 @@ pub const Instruction = union(enum) {
                     },
                     else => DecodeError.UnknownInstruction,
                 },
-                0b1110001 => .{
+                0b1110001 => if (decodeRs2(from) == 0 and funct3 == 0b001) .{
                     .fclass_d = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
                     },
-                },
+                } else DecodeError.UnknownInstruction,
                 0b1100001 => switch (decodeRs2(from)) {
                     0b00000 => .{
                         .fcvt_w_d = .{
