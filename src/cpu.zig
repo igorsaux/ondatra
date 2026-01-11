@@ -17,9 +17,13 @@ pub const Config = struct {
 
         ecall: ?*const fn (cpu: *anyopaque, cause: arch.Registers.Mcause.Exception) callconv(.@"inline") Action = null,
         ebreak: ?*const fn (cpu: *anyopaque) callconv(.@"inline") Action = null,
-
         /// Return true to continue, false to halt.
         wfi: ?*const fn (cpu: *anyopaque) callconv(.@"inline") bool = null,
+        isMmio: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") bool = null,
+        read: ?*const fn (cpu: *anyopaque, address: u32, count: u3) callconv(.@"inline") ?u64 = null,
+        write: ?*const fn (cpu: *anyopaque, address: u32, count: u3, value: anytype) callconv(.@"inline") bool = null,
+        readTranslate: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") u32 = null,
+        writeTranslate: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") u32 = null,
     };
 
     pub const Compile = struct {
@@ -116,7 +120,13 @@ pub inline fn Cpu(comptime config: Config) type {
     return struct {
         const Self = @This();
 
-        const MemoryError = error{ AddressOutOfBounds, MisalignedAddress, PmpViolation };
+        const MemoryError = error{
+            AddressOutOfBounds,
+            MisalignedAddress,
+            PmpViolation,
+            ReadFailed,
+            WriteFailed,
+        };
         const FetchError = MemoryError || arch.Instruction.DecodeError;
 
         const ErrorCause = enum { instruction, load, store };
@@ -291,6 +301,23 @@ pub inline fn Cpu(comptime config: Config) type {
 
             const byte_len = @sizeOf(T);
 
+            if (comptime config.hooks.isMmio != null and config.hooks.read != null) {
+                if (config.hooks.isMmio.?(this, address)) {
+                    if (config.hooks.read.?(this, address, @intCast(byte_len))) |value| {
+                        return @bitCast(@as(
+                            std.meta.Int(.unsigned, @bitSizeOf(T)),
+                            @truncate(value),
+                        ));
+                    } else {
+                        return MemoryError.ReadFailed;
+                    }
+                }
+            }
+
+            if (comptime config.hooks.readTranslate) |hook| {
+                address = hook(this, address);
+            }
+
             if (comptime config.runtime.enable_pmp) {
                 if (!this.registers.checkPmpAccess(address, access, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
@@ -317,6 +344,21 @@ pub inline fn Cpu(comptime config: Config) type {
 
             const T = @TypeOf(value);
             const byte_len = @sizeOf(T);
+
+            // MMIO hook
+            if (comptime config.hooks.isMmio != null and config.hooks.write != null) {
+                if (config.hooks.isMmio.?(this, address)) {
+                    if (!config.hooks.write.?(this, address, @intCast(byte_len), value)) {
+                        return MemoryError.WriteFailed;
+                    }
+
+                    return;
+                }
+            }
+
+            if (comptime config.hooks.writeTranslate) |hook| {
+                address = hook(this, address);
+            }
 
             if (comptime config.runtime.enable_pmp) {
                 if (!this.registers.checkPmpAccess(address, .write, this.getPrivilege())) {
@@ -357,18 +399,27 @@ pub inline fn Cpu(comptime config: Config) type {
         }
 
         inline fn memoryErrorToException(err: MemoryError, cause: ErrorCause) arch.Registers.Mcause.Exception {
+            switch (err) {
+                MemoryError.ReadFailed => return .load_access_fault,
+                MemoryError.WriteFailed => return .store_access_fault,
+                else => {},
+            }
+
             return switch (cause) {
                 .instruction => switch (err) {
                     MemoryError.AddressOutOfBounds, MemoryError.PmpViolation => .instruction_access_fault,
                     MemoryError.MisalignedAddress => .instruction_address_misaligned,
+                    else => unreachable,
                 },
                 .load => switch (err) {
                     MemoryError.AddressOutOfBounds, MemoryError.PmpViolation => .load_access_fault,
                     MemoryError.MisalignedAddress => .load_address_misaligned,
+                    else => unreachable,
                 },
                 .store => switch (err) {
                     MemoryError.AddressOutOfBounds, MemoryError.PmpViolation => .store_access_fault,
                     MemoryError.MisalignedAddress => .store_address_misaligned,
+                    else => unreachable,
                 },
             };
         }
@@ -382,6 +433,8 @@ pub inline fn Cpu(comptime config: Config) type {
                 FetchError.AddressOutOfBounds, FetchError.PmpViolation => .instruction_access_fault,
                 FetchError.MisalignedAddress => .instruction_address_misaligned,
                 FetchError.UnknownInstruction, FetchError.BadRegister => .illegal_instruction,
+                FetchError.ReadFailed => .load_access_fault,
+                FetchError.WriteFailed => .store_access_fault,
             };
 
             return trapState(exception, this.registers.pc);
