@@ -257,7 +257,7 @@ pub const Registers = struct {
         // WPRI mask: bits that must preserve value on write
         pub const WPRI_MASK: u32 = 0x007F_E1E5;
         // Writable bits mask for M+U system
-        pub const WRITE_MASK: u32 = 0x0000_7888; // MIE, MPIE, MPP, FS
+        pub const WRITE_MASK: u32 = 0x0002_7888; // MIE, MPIE, MPP, FS, MPRV
 
         pub inline fn updateSD(this: *Mstatus) void {
             this.sd = (this.fs == 0b11) or (this.xs == 0b11) or (this.vs == 0b11);
@@ -396,7 +396,8 @@ pub const Registers = struct {
                 .napot => blk: {
                     // Find the lowest zero bit to determine range size
                     const trailing_ones = @ctz(~addr);
-                    const range_size: u34 = @as(u34, 8) << trailing_ones;
+                    const clamped = if (trailing_ones > 31) 31 else trailing_ones;
+                    const range_size: u34 = @as(u34, 8) << @intCast(clamped);
                     const base = (@as(u34, addr) & ~(range_size / 4 - 1)) << 2;
 
                     break :blk .{ .start = base, .end = base + range_size };
@@ -481,6 +482,8 @@ pub const Registers = struct {
     fcsr: Fcsr = .{},
     cycle: u64 = 0,
     instret: u64 = 0,
+    mtime: u64 = 0,
+    mtimecmp: u64 = 0xFFFFFFFF_FFFFFFFF,
     pc: u32 = 0,
     privilege: PrivilegeLevel = .machine,
     mstatus: Mstatus = .{},
@@ -594,7 +597,8 @@ pub const Registers = struct {
     }
 
     pub inline fn checkPmpAccess(this: *Registers, addr: u32, access_type: Pmp.AccessType, priv: PrivilegeLevel) bool {
-        const effective_priv: PrivilegeLevel = if (priv == .machine and this.mstatus.mprv)
+        // MPRV only affects load/store, not instruction fetch (execute)
+        const effective_priv: PrivilegeLevel = if (priv == .machine and this.mstatus.mprv and access_type != .execute)
             this.mstatus.mpp.sanitize()
         else
             priv;
@@ -646,7 +650,7 @@ pub const Registers = struct {
         }
 
         // No PMP entry matched - denied for U-mode, allowed for M-mode
-        return priv == .machine;
+        return effective_priv == .machine;
     }
 
     pub inline fn readCsr(this: *Registers, csr: Csr, priv: PrivilegeLevel) Csr.Error!u32 {
@@ -664,10 +668,10 @@ pub const Registers = struct {
             .frm => @as(u32, @intFromEnum(this.fcsr.frm)),
             .fcsr => @as(u32, @bitCast(this.fcsr)) & 0xFF,
             // User counters (also accessible from M-mode)
-            .cycle => @truncate(this.cycle),
             .time => @truncate(this.mtime),
-            .cycleh => @truncate(this.cycle >> 32),
             .timeh => @truncate(this.mtime >> 32),
+            .cycle => @truncate(this.cycle),
+            .cycleh => @truncate(this.cycle >> 32),
             .instret => @truncate(this.instret),
             .instreth => @truncate(this.instret >> 32),
             // Machine information (read-only)
@@ -813,8 +817,10 @@ pub const Registers = struct {
             .fflags => @as(u32, this.fcsr.getFflags()),
             .frm => @as(u32, @intFromEnum(this.fcsr.frm)),
             .fcsr => @as(u32, @bitCast(this.fcsr)) & 0xFF,
-            .cycle, .time => @truncate(this.cycle),
-            .cycleh, .timeh => @truncate(this.cycle >> 32),
+            .cycle => @truncate(this.cycle),
+            .cycleh => @truncate(this.cycle >> 32),
+            .time => @truncate(this.mtime),
+            .timeh => @truncate(this.mtime >> 32),
             .instret => @truncate(this.instret),
             .instreth => @truncate(this.instret >> 32),
             .mstatus => @bitCast(this.mstatus),
@@ -898,6 +904,50 @@ pub const Registers = struct {
         }
 
         this.pmpaddr[index] = value;
+    }
+
+    pub inline fn updateTimer(this: *Registers, ticks: u64) void {
+        this.mtime +%= ticks;
+        this.mip.mtip = this.mtime >= this.mtimecmp;
+    }
+
+    pub inline fn setMtime(this: *Registers, value: u64) void {
+        this.mtime = value;
+        this.mip.mtip = this.mtime >= this.mtimecmp;
+    }
+
+    pub inline fn setMtimecmp(this: *Registers, value: u64) void {
+        this.mtimecmp = value;
+        this.mip.mtip = this.mtime >= this.mtimecmp;
+    }
+
+    pub inline fn hasPendingInterrupt(this: *Registers) bool {
+        if (!this.mstatus.mie) {
+            return false;
+        }
+
+        const pending: u32 = @bitCast(this.mip);
+        const enabled: u32 = @bitCast(this.mie);
+
+        return (pending & enabled) != 0;
+    }
+
+    pub inline fn getPendingInterrupt(this: *Registers) ?Mcause.Interrupt {
+        if (!this.mstatus.mie) return null;
+
+        if (this.mip.meip and this.mie.meie) {
+            return .machine_external;
+        }
+
+        if (this.mip.msip and this.mie.msie) {
+            return .machine_software;
+        }
+
+        if (this.mip.mtip and this.mie.mtie) {
+            return .machine_timer;
+        }
+
+        return null;
     }
 
     pub inline fn getAbiName(n: u8) []const u8 {

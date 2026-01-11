@@ -280,6 +280,7 @@ const FAST: ondatra.cpu.Config.Runtime = .{
     .enable_interrupts = false,
     .enable_branch_alignment = false,
     .enable_fpu_flags = false,
+    .timer_ticks_per_step = 0,
 };
 
 const fibbonacciCompilantBenchmark = MakeBenchmark("fibbonacci.bin", .compliant);
@@ -311,13 +312,15 @@ fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Conf
                 over: bool = false,
                 cpu: Cpu,
 
-                inline fn ecall(ctx: *anyopaque) bool {
+                inline fn ecall(ctx: *anyopaque, cause: ondatra.arch.Registers.Mcause.Exception) ondatra.cpu.Config.Hooks.Action {
+                    _ = cause;
+
                     const this: *Cpu = @ptrCast(@alignCast(ctx));
                     const state: *@This() = @fieldParentPtr("cpu", this);
 
                     state.over = true;
 
-                    return true;
+                    return .skip;
                 }
             };
 
@@ -326,6 +329,7 @@ fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Conf
                 .cpu = .init(&ram),
             };
 
+            state.cpu.registers.mstatus.fs = 0b01;
             state.cpu.loadElf(allocator, PROGRAM) catch |err| {
                 std.debug.print("failed to load the program: {t}\n", .{err});
 
