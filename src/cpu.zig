@@ -9,20 +9,17 @@ const utils = @import("utils.zig");
 
 pub const Config = struct {
     pub const Hooks = struct {
-        ecall: *const fn (cpu: *anyopaque) callconv(.@"inline") bool = ecallNoop,
-        ebreak: *const fn (cpu: *anyopaque) callconv(.@"inline") bool = ebreakNoop,
+        pub const Action = enum {
+            proceed,
+            skip,
+            halt,
+        };
 
-        inline fn ecallNoop(cpu: *anyopaque) bool {
-            _ = cpu;
+        ecall: ?*const fn (cpu: *anyopaque, cause: arch.Registers.Mcause.Exception) callconv(.@"inline") Action = null,
+        ebreak: ?*const fn (cpu: *anyopaque) callconv(.@"inline") Action = null,
 
-            return false;
-        }
-
-        inline fn ebreakNoop(cpu: *anyopaque) bool {
-            _ = cpu;
-
-            return false;
-        }
+        /// Return true to continue, false to halt.
+        wfi: ?*const fn (cpu: *anyopaque) callconv(.@"inline") bool = null,
     };
 
     pub const Compile = struct {
@@ -793,22 +790,48 @@ pub inline fn Cpu(comptime config: Config) type {
                         _ => .ecall_from_m,
                     };
 
-                    if (!config.hooks.ecall(@ptrCast(this))) {
-                        this.incCounters(true);
+                    if (comptime config.hooks.ecall) |hook| {
+                        switch (hook(@ptrCast(this), cause)) {
+                            .proceed => {},
+                            .skip => {
+                                this.incCounters(true);
+                                this.registers.pc +%= 4;
 
-                        return trapState(cause, 0);
+                                return .ok;
+                            },
+                            .halt => {
+                                this.incCounters(true);
+
+                                return .halt;
+                            },
+                        }
                     }
 
-                    this.registers.pc +%= 4;
+                    this.incCounters(true);
+
+                    return trapState(cause, 0);
                 },
                 .ebreak => {
-                    if (!config.hooks.ebreak(@ptrCast(this))) {
-                        this.incCounters(true);
+                    if (comptime config.hooks.ebreak) |hook| {
+                        switch (hook(this)) {
+                            .proceed => {},
+                            .skip => {
+                                this.incCounters(true);
+                                this.registers.pc +%= 4;
 
-                        return trapState(.breakpoint, this.registers.pc); // breakpoint: mtval = PC
+                                return .ok;
+                            },
+                            .halt => {
+                                this.incCounters(true);
+
+                                return .halt;
+                            },
+                        }
                     }
 
-                    this.registers.pc +%= 4;
+                    this.incCounters(true);
+
+                    return trapState(.breakpoint, this.registers.pc); // breakpoint: mtval = PC
                 },
                 .mul => |i| {
                     if (comptime !config.runtime.enable_m_ext) {
@@ -2803,7 +2826,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .wfi => {
                     // WFI in U-mode with TW=1 causes illegal instruction
-                    if (this.registers.privilege == .user and this.registers.mstatus.tw) {
+                    if (this.registers.privilege.sanitize() == .user and this.registers.mstatus.tw) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -2817,12 +2840,24 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     if (pending != 0) {
                         // Enabled interrupt is pending - resume execution
-                        this.registers.pc +%= 4;
-                    } else {
                         this.incCounters(true);
+                        this.registers.pc +%= 4;
 
-                        return .halt;
+                        return .ok;
                     }
+
+                    if (comptime config.hooks.wfi) |hook| {
+                        if (hook(this)) {
+                            this.incCounters(true);
+                            this.registers.pc +%= 4;
+
+                            return .ok;
+                        }
+                    }
+
+                    this.incCounters(true);
+
+                    return .halt;
                 },
             }
 
