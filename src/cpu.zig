@@ -20,8 +20,8 @@ pub const Config = struct {
         /// Return true to continue, false to halt.
         wfi: ?*const fn (cpu: *anyopaque) callconv(.@"inline") bool = null,
         isMmio: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") bool = null,
-        read: ?*const fn (cpu: *anyopaque, address: u32, count: u3) callconv(.@"inline") ?u64 = null,
-        write: ?*const fn (cpu: *anyopaque, address: u32, count: u3, value: anytype) callconv(.@"inline") bool = null,
+        read: ?*const fn (cpu: *anyopaque, address: u32, dst: []u8) callconv(.@"inline") bool = null,
+        write: ?*const fn (cpu: *anyopaque, address: u32, src: []const u8) callconv(.@"inline") bool = null,
         readTranslate: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") u32 = null,
         writeTranslate: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") u32 = null,
     };
@@ -255,45 +255,50 @@ pub inline fn Cpu(comptime config: Config) type {
             return .{ .trap = .{ .cause = .{ .exception = exception }, .tval = tval } };
         }
 
-        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8) ElfLoadError!void {
+        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8, offset: i32) ElfLoadError!void {
             var reader: std.Io.Reader = .fixed(content);
 
             var file = try elf.File.parse(allocator, &reader);
             defer file.deinit(allocator);
 
+            const ventry = file.header.entry;
+            file.header.entry = @as(u32, @intCast(@as(i32, @intCast(file.header.entry)) +% offset));
+
             if (file.header.entry > this.ram.len) {
                 return ElfLoadError.OutOfRam;
             }
 
-            for (file.program_headers.items) |header| {
+            for (file.program_headers.items) |*header| {
                 if (header.ty != .load) {
                     continue;
                 }
+
+                header.vaddr = @as(u32, @intCast(@as(i32, @intCast(header.vaddr)) +% offset));
 
                 if (header.vaddr >= this.ram.len) {
                     return ElfLoadError.OutOfRam;
                 }
 
-                if (header.vaddr + header.filesz > this.ram.len or header.vaddr + header.memsz > this.ram.len) {
+                if (header.vaddr +% header.filesz > this.ram.len or header.vaddr +% header.memsz > this.ram.len) {
                     return ElfLoadError.OutOfRam;
                 }
 
                 if (header.filesz > 0) {
                     const from: u32 = header.vaddr;
-                    const to: u32 = from + header.filesz;
+                    const to: u32 = from +% header.filesz;
 
                     @memcpy(this.ram[from..to], content[header.offset .. header.offset + header.filesz]);
                 }
 
                 if (header.memsz > header.filesz) {
-                    const from: u32 = header.vaddr + header.filesz;
-                    const to: u32 = from + header.memsz - header.filesz;
+                    const from: u32 = header.vaddr +% header.filesz;
+                    const to: u32 = (from +% header.memsz) - header.filesz;
 
                     @memset(this.ram[from..to], 0);
                 }
             }
 
-            this.registers.pc = file.header.entry;
+            this.registers.pc = ventry;
         }
 
         pub inline fn readMemory(this: *Self, address: u32, comptime T: type, comptime access: arch.Registers.Pmp.AccessType) MemoryError!T {
@@ -303,38 +308,38 @@ pub inline fn Cpu(comptime config: Config) type {
 
             if (comptime config.hooks.isMmio != null and config.hooks.read != null) {
                 if (config.hooks.isMmio.?(this, address)) {
-                    if (config.hooks.read.?(this, address, @intCast(byte_len))) |value| {
-                        return @bitCast(@as(
-                            std.meta.Int(.unsigned, @bitSizeOf(T)),
-                            @truncate(value),
-                        ));
+                    var dst: [byte_len]u8 = undefined;
+
+                    if (config.hooks.read.?(this, address, &dst)) {
+                        return std.mem.bytesToValue(T, &dst);
                     } else {
                         return MemoryError.ReadFailed;
                     }
                 }
             }
 
-            if (comptime config.hooks.readTranslate) |hook| {
-                address = hook(this, address);
-            }
+            const translated = if (comptime config.hooks.readTranslate) |hook|
+                hook(this, address)
+            else
+                address;
 
             if (comptime config.runtime.enable_pmp) {
-                if (!this.registers.checkPmpAccess(address, access, this.getPrivilege())) {
+                if (!this.registers.checkPmpAccess(translated, access, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
                 }
             }
 
-            if (address + byte_len > this.ram.len) {
+            if (translated + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
             }
 
             if (comptime config.runtime.enable_memory_alignment) {
-                if (address % byte_len != 0) {
+                if (translated % byte_len != 0) {
                     return MemoryError.MisalignedAddress;
                 }
             }
 
-            const result: T = std.mem.bytesToValue(T, this.ram[address .. address + byte_len]);
+            const result: T = std.mem.bytesToValue(T, this.ram[translated .. translated + byte_len]);
 
             return std.mem.toNative(T, result, arch.ENDIAN);
         }
@@ -345,10 +350,11 @@ pub inline fn Cpu(comptime config: Config) type {
             const T = @TypeOf(value);
             const byte_len = @sizeOf(T);
 
-            // MMIO hook
             if (comptime config.hooks.isMmio != null and config.hooks.write != null) {
                 if (config.hooks.isMmio.?(this, address)) {
-                    if (!config.hooks.write.?(this, address, @intCast(byte_len), value)) {
+                    const src = std.mem.asBytes(&value);
+
+                    if (!config.hooks.write.?(this, address, src)) {
                         return MemoryError.WriteFailed;
                     }
 
@@ -356,28 +362,29 @@ pub inline fn Cpu(comptime config: Config) type {
                 }
             }
 
-            if (comptime config.hooks.writeTranslate) |hook| {
-                address = hook(this, address);
-            }
+            const translated = if (comptime config.hooks.writeTranslate) |hook|
+                hook(this, address)
+            else
+                address;
 
             if (comptime config.runtime.enable_pmp) {
-                if (!this.registers.checkPmpAccess(address, .write, this.getPrivilege())) {
+                if (!this.registers.checkPmpAccess(translated, .write, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
                 }
             }
 
-            if (address + byte_len > this.ram.len) {
+            if (translated + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
             }
 
             if (comptime config.runtime.enable_memory_alignment) {
-                if (address % byte_len != 0) {
+                if (translated % byte_len != 0) {
                     return MemoryError.MisalignedAddress;
                 }
             }
 
             const bytes = std.mem.asBytes(&std.mem.nativeTo(T, value, arch.ENDIAN));
-            @memcpy(this.ram[address .. address + byte_len], bytes);
+            @memcpy(this.ram[translated .. translated + byte_len], bytes);
         }
 
         inline fn fetch(this: *Self) FetchError!arch.Instruction {
