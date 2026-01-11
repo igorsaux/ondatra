@@ -551,14 +551,14 @@ pub const Registers = struct {
         this.float[n] = @bitCast(value);
     }
 
-    pub inline fn canAccessCsr(this: *Registers, csr: Csr) bool {
+    pub inline fn canAccessCsr(csr: Csr, priv: PrivilegeLevel) bool {
         const required = csr.getRequiredPrivilege();
 
-        return @intFromEnum(this.privilege) >= @intFromEnum(required);
+        return @intFromEnum(priv) >= @intFromEnum(required);
     }
 
-    inline fn canAccessCounter(this: *Registers, csr: Csr) bool {
-        if (this.privilege == .machine) return true;
+    inline fn canAccessCounter(this: *Registers, csr: Csr, priv: PrivilegeLevel) bool {
+        if (priv == .machine) return true;
 
         return switch (csr) {
             .cycle, .cycleh => this.mcounteren.cy,
@@ -593,9 +593,7 @@ pub const Registers = struct {
         this.pmpcfg[cfg_reg] = (this.pmpcfg[cfg_reg] & ~mask) | (@as(u8, @bitCast(cfg)) << cfg_offset);
     }
 
-    pub inline fn checkPmpAccess(this: *Registers, addr: u32, access_type: Pmp.AccessType) bool {
-        const priv = this.privilege.sanitize();
-
+    pub inline fn checkPmpAccess(this: *Registers, addr: u32, access_type: Pmp.AccessType, priv: PrivilegeLevel) bool {
         // M-mode without MPRV bypasses PMP unless L bit is set
         if (priv == .machine and !this.mstatus.mprv) {
             // Still check locked entries
@@ -646,12 +644,12 @@ pub const Registers = struct {
         return priv == .machine;
     }
 
-    pub inline fn readCsr(this: *Registers, csr: Csr) Csr.Error!u32 {
-        if (!this.canAccessCsr(csr)) {
+    pub inline fn readCsr(this: *Registers, csr: Csr, priv: PrivilegeLevel) Csr.Error!u32 {
+        if (!canAccessCsr(csr, priv)) {
             return Csr.Error.IllegalInstruction;
         }
 
-        if (!this.canAccessCounter(csr)) {
+        if (!this.canAccessCounter(csr, priv)) {
             return Csr.Error.IllegalInstruction;
         }
 
@@ -713,8 +711,8 @@ pub const Registers = struct {
         };
     }
 
-    pub inline fn writeCsr(this: *Registers, csr: Csr, value: u32) Csr.Error!void {
-        if (!this.canAccessCsr(csr)) {
+    pub inline fn writeCsr(this: *Registers, csr: Csr, value: u32, priv: PrivilegeLevel) Csr.Error!void {
+        if (!canAccessCsr(csr, priv)) {
             return Csr.Error.IllegalInstruction;
         }
 
@@ -5400,9 +5398,9 @@ test "mstatus write preserves WPRI fields" {
     regs.privilege = .machine;
 
     // Write with garbage in reserved fields
-    try regs.writeCsr(.mstatus, 0xFFFFFFFF);
+    try regs.writeCsr(.mstatus, 0xFFFFFFFF, regs.privilege);
 
-    const val: u32 = try regs.readCsr(.mstatus);
+    const val: u32 = try regs.readCsr(.mstatus, regs.privilege);
     // Only MIE, MPIE, MPP should be writable
     try std.testing.expectEqual(@as(u32, 0x1888), val & 0x1FFF);
 }
@@ -5412,7 +5410,7 @@ test "mstatus.mpp only accepts valid privilege levels" {
     regs.privilege = .machine;
 
     // Try to set MPP to invalid value (supervisor = 01)
-    try regs.writeCsr(.mstatus, 0x800); // MPP = 01
+    try regs.writeCsr(.mstatus, 0x800, regs.privilege); // MPP = 01
 
     // Should default to machine mode
     try std.testing.expectEqual(PrivilegeLevel.machine, regs.mstatus.mpp);

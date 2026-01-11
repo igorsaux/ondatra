@@ -250,7 +250,7 @@ pub inline fn Cpu(comptime config: Config) type {
             const byte_len = @sizeOf(T);
 
             if (comptime config.runtime.enable_pmp) {
-                if (!this.registers.checkPmpAccess(address, access)) {
+                if (!this.registers.checkPmpAccess(address, access, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
                 }
             }
@@ -277,7 +277,7 @@ pub inline fn Cpu(comptime config: Config) type {
             const byte_len = @sizeOf(T);
 
             if (comptime config.runtime.enable_pmp) {
-                if (!this.registers.checkPmpAccess(address, .write)) {
+                if (!this.registers.checkPmpAccess(address, .write, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
                 }
             }
@@ -354,7 +354,7 @@ pub inline fn Cpu(comptime config: Config) type {
             this.registers.mtval = tval;
 
             this.registers.mstatus.mpie = this.registers.mstatus.mie;
-            this.registers.mstatus.mpp = this.registers.privilege.sanitize();
+            this.registers.mstatus.mpp = this.getPrivilege();
             this.registers.mstatus.mie = false;
 
             this.registers.privilege = .machine;
@@ -363,11 +363,8 @@ pub inline fn Cpu(comptime config: Config) type {
         }
 
         inline fn executeMret(this: *Self) State {
-            if (comptime config.runtime.enable_privilege) {
-                // mret is only valid in M-mode
-                if (this.registers.privilege != .machine) {
-                    return trapState(.illegal_instruction, 0);
-                }
+            if (this.getPrivilege() != .machine) {
+                return trapState(.illegal_instruction, 0);
             }
 
             this.registers.privilege = this.registers.mstatus.mpp.sanitize();
@@ -387,8 +384,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 return null;
             }
 
-            const priv = this.registers.privilege.sanitize();
-
+            const priv = this.getPrivilege();
             const can_interrupt = this.registers.mstatus.mie or (priv == .user);
 
             if (!can_interrupt) {
@@ -778,13 +774,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .ecall => {
-                    const cause: arch.Registers.Mcause.Exception = if (comptime config.runtime.enable_privilege)
-                        switch (this.registers.privilege.sanitize()) {
-                            .user => .ecall_from_u,
-                            .machine => .ecall_from_m,
-                            _ => .ecall_from_m,
-                        }
-                    else switch (config.runtime.effective_privilege) {
+                    const cause: arch.Registers.Mcause.Exception = switch (this.getPrivilege()) {
                         .user => .ecall_from_u,
                         .machine => .ecall_from_m,
                         _ => .ecall_from_m,
@@ -2456,7 +2446,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     if (comptime config.runtime.enable_csr_checks) {
                         if (i.rd != 0) {
-                            const old = this.registers.readCsr(csr) catch {
+                            const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
                                 this.incCounters(true);
 
                                 return trapState(.illegal_instruction, 0);
@@ -2465,7 +2455,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.set(i.rd, @bitCast(old));
                         }
 
-                        this.registers.writeCsr(csr, rs1_val) catch {
+                        this.registers.writeCsr(csr, rs1_val, this.getPrivilege()) catch {
                             this.incCounters(true);
 
                             return trapState(.illegal_instruction, 0);
@@ -2486,7 +2476,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
-                        const old = this.registers.readCsr(csr) catch {
+                        const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
                             this.incCounters(true);
 
                             return trapState(.illegal_instruction, 0);
@@ -2497,7 +2487,7 @@ pub inline fn Cpu(comptime config: Config) type {
                         if (i.rs1 != 0) {
                             const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
 
-                            this.registers.writeCsr(csr, old | rs1_val) catch {
+                            this.registers.writeCsr(csr, old | rs1_val, this.getPrivilege()) catch {
                                 this.incCounters(true);
 
                                 return trapState(.illegal_instruction, 0);
@@ -2521,7 +2511,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
-                        const old = this.registers.readCsr(csr) catch {
+                        const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
                             this.incCounters(true);
 
                             return trapState(.illegal_instruction, 0);
@@ -2532,7 +2522,7 @@ pub inline fn Cpu(comptime config: Config) type {
                         if (i.rs1 != 0) {
                             const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
 
-                            this.registers.writeCsr(csr, old & ~rs1_val) catch {
+                            this.registers.writeCsr(csr, old & ~rs1_val, this.getPrivilege()) catch {
                                 this.incCounters(true);
 
                                 return trapState(.illegal_instruction, 0);
@@ -2557,7 +2547,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     if (comptime config.runtime.enable_csr_checks) {
                         if (i.rd != 0) {
-                            const old = this.registers.readCsr(csr) catch {
+                            const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
                                 this.incCounters(true);
 
                                 return trapState(.illegal_instruction, 0);
@@ -2566,7 +2556,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.set(i.rd, @bitCast(old));
                         }
 
-                        this.registers.writeCsr(csr, @as(u32, i.uimm)) catch {
+                        this.registers.writeCsr(csr, @as(u32, i.uimm), this.getPrivilege()) catch {
                             this.incCounters(true);
 
                             return trapState(.illegal_instruction, 0);
@@ -2587,7 +2577,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
-                        const old = this.registers.readCsr(csr) catch {
+                        const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
                             this.incCounters(true);
 
                             return trapState(.illegal_instruction, 0);
@@ -2596,7 +2586,7 @@ pub inline fn Cpu(comptime config: Config) type {
                         this.registers.set(i.rd, @bitCast(old));
 
                         if (i.uimm != 0) {
-                            this.registers.writeCsr(csr, old | @as(u32, i.uimm)) catch {
+                            this.registers.writeCsr(csr, old | @as(u32, i.uimm), this.getPrivilege()) catch {
                                 this.incCounters(true);
 
                                 return trapState(.illegal_instruction, 0);
@@ -2618,7 +2608,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
-                        const old = this.registers.readCsr(csr) catch {
+                        const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
                             this.incCounters(true);
 
                             return trapState(.illegal_instruction, 0);
@@ -2627,7 +2617,7 @@ pub inline fn Cpu(comptime config: Config) type {
                         this.registers.set(i.rd, @bitCast(old));
 
                         if (i.uimm != 0) {
-                            this.registers.writeCsr(csr, old & ~@as(u32, i.uimm)) catch {
+                            this.registers.writeCsr(csr, old & ~@as(u32, i.uimm), this.getPrivilege()) catch {
                                 this.incCounters(true);
 
                                 return trapState(.illegal_instruction, 0);
@@ -2826,7 +2816,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .wfi => {
                     // WFI in U-mode with TW=1 causes illegal instruction
-                    if (this.registers.privilege.sanitize() == .user and this.registers.mstatus.tw) {
+                    if (this.getPrivilege() == .user and this.registers.mstatus.tw) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
