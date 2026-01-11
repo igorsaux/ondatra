@@ -7,96 +7,112 @@ const elf = @import("elf.zig");
 const arch = @import("arch.zig");
 const utils = @import("utils.zig");
 
-pub const Hooks = struct {
-    ecall: *const fn (cpu: *anyopaque) callconv(.@"inline") bool = ecallNoop,
-    ebreak: *const fn (cpu: *anyopaque) callconv(.@"inline") bool = ebreakNoop,
-
-    inline fn ecallNoop(cpu: *anyopaque) bool {
-        _ = cpu;
-
-        return false;
-    }
-
-    inline fn ebreakNoop(cpu: *anyopaque) bool {
-        _ = cpu;
-
-        return false;
-    }
-};
-
 pub const Config = struct {
-    /// Enable Physical Memory Protection checks.
-    /// Disable for ~2-3x speedup when running trusted code.
-    enable_pmp: bool = true,
+    pub const Hooks = struct {
+        ecall: *const fn (cpu: *anyopaque) callconv(.@"inline") bool = ecallNoop,
+        ebreak: *const fn (cpu: *anyopaque) callconv(.@"inline") bool = ebreakNoop,
 
-    /// Enable memory alignment checks for loads/stores.
-    /// RISC-V spec requires this, disable only for known-aligned code.
-    enable_memory_alignment: bool = true,
+        inline fn ecallNoop(cpu: *anyopaque) bool {
+            _ = cpu;
 
-    /// Enable privilege level enforcement.
-    /// When disabled, all code runs in effective_privilege mode.
-    enable_privilege: bool = true,
+            return false;
+        }
 
-    /// Enable CSR privilege and read-only checks.
-    enable_csr_checks: bool = true,
+        inline fn ebreakNoop(cpu: *anyopaque) bool {
+            _ = cpu;
 
-    /// Privilege level when enable_privilege=false
-    effective_privilege: arch.PrivilegeLevel = .machine,
-
-    /// Enable interrupt checking each step.
-    /// Disable if using polling-based interrupt model.
-    enable_interrupts: bool = true,
-
-    /// Enable branch/jump target alignment checks (4-byte for RV32I).
-    enable_branch_alignment: bool = true,
-
-    /// Enable floating-point extensions (F/D).
-    enable_fpu: bool = true,
-
-    /// Enable FPU exception flags (NV, DZ, OF, UF, NX).
-    /// When disabled, FCSR flags are not updated.
-    enable_fpu_flags: bool = true,
-
-    /// Enable cycle/instret counter updates.
-    enable_counters: bool = true,
-
-    /// Enable M extension (multiply/divide)
-    enable_m_ext: bool = true,
-
-    /// Enable Zba extension (address generation)
-    enable_zba_ext: bool = true,
-
-    /// Enable Zbb extension (bit manipulation)
-    enable_zbb_ext: bool = true,
-
-    /// Maximum performance, minimal checks (for trusted code)
-    pub const fast = Config{
-        .enable_pmp = false,
-        .enable_memory_alignment = false,
-        .enable_privilege = false,
-        .enable_csr_checks = false,
-        .enable_interrupts = false,
-        .enable_branch_alignment = false,
-        .enable_fpu_flags = false,
-        .enable_counters = false,
+            return false;
+        }
     };
 
-    /// Full spec compliance (default)
-    pub const compliant = Config{};
+    pub const Compile = struct {
+        inline_execute: bool = true,
 
-    /// Embedded system (no FPU, with protection)
-    pub const embedded = Config{
-        .enable_fpu = false,
-        .enable_fpu_flags = false,
+        pub const fast_compile: Compile = .{
+            .inline_execute = false,
+        };
+
+        pub const fast_execution: Compile = .{};
     };
 
-    /// User-mode sandbox (full protection, no M-mode features)
-    pub const sandbox = Config{
-        .effective_privilege = .user,
+    pub const Runtime = struct {
+        /// Enable Physical Memory Protection checks.
+        /// Disable for ~2-3x speedup when running trusted code.
+        enable_pmp: bool = true,
+
+        /// Enable memory alignment checks for loads/stores.
+        /// RISC-V spec requires this, disable only for known-aligned code.
+        enable_memory_alignment: bool = true,
+
+        /// Enable privilege level enforcement.
+        /// When disabled, all code runs in effective_privilege mode.
+        enable_privilege: bool = true,
+
+        /// Enable CSR privilege and read-only checks.
+        enable_csr_checks: bool = true,
+
+        /// Privilege level when enable_privilege=false
+        effective_privilege: arch.PrivilegeLevel = .machine,
+
+        /// Enable interrupt checking each step.
+        /// Disable if using polling-based interrupt model.
+        enable_interrupts: bool = true,
+
+        /// Enable branch/jump target alignment checks (4-byte for RV32I).
+        enable_branch_alignment: bool = true,
+
+        /// Enable floating-point extensions (F/D).
+        enable_fpu: bool = true,
+
+        /// Enable FPU exception flags (NV, DZ, OF, UF, NX).
+        /// When disabled, FCSR flags are not updated.
+        enable_fpu_flags: bool = true,
+
+        /// Enable cycle/instret counter updates.
+        enable_counters: bool = true,
+
+        /// Enable M extension (multiply/divide)
+        enable_m_ext: bool = true,
+
+        /// Enable Zba extension (address generation)
+        enable_zba_ext: bool = true,
+
+        /// Enable Zbb extension (bit manipulation)
+        enable_zbb_ext: bool = true,
+
+        /// Maximum performance, minimal checks (for trusted code)
+        pub const fast = Runtime{
+            .enable_pmp = false,
+            .enable_memory_alignment = false,
+            .enable_privilege = false,
+            .enable_csr_checks = false,
+            .enable_interrupts = false,
+            .enable_branch_alignment = false,
+            .enable_fpu_flags = false,
+            .enable_counters = false,
+        };
+
+        /// Full spec compliance (default)
+        pub const compliant = Runtime{};
+
+        /// Embedded system (no FPU, with protection)
+        pub const embedded = Runtime{
+            .enable_fpu = false,
+            .enable_fpu_flags = false,
+        };
+
+        /// User-mode sandbox (full protection, no M-mode features)
+        pub const sandbox = Runtime{
+            .effective_privilege = .user,
+        };
     };
+
+    hooks: Hooks = .{},
+    compile: Compile = .fast_execution,
+    runtime: Runtime = .compliant,
 };
 
-pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
+pub inline fn Cpu(comptime config: Config) type {
     return struct {
         const Self = @This();
 
@@ -142,7 +158,9 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
         }
 
         pub inline fn step(this: *Self) State {
-            if (comptime config.enable_interrupts) {
+            @setEvalBranchQuota(std.math.maxInt(u32));
+
+            if (comptime config.runtime.enable_interrupts) {
                 if (this.checkInterrupts()) |int_cause| {
                     this.handleTrap(.{ .interrupt = int_cause }, 0);
                     this.incCounters(false);
@@ -155,10 +173,16 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 return this.fetchErrorToState(err);
             };
 
-            return this.execute(instr);
+            if (comptime config.compile.inline_execute) {
+                return @call(.always_inline, execute, .{ this, instr });
+            } else {
+                return @call(.never_inline, execute, .{ this, instr });
+            }
         }
 
         pub inline fn run(this: *Self, times: usize) State {
+            @setEvalBranchQuota(std.math.maxInt(u32));
+
             for (0..times) |_| {
                 const state = this.step();
 
@@ -170,11 +194,11 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
             return .ok;
         }
 
-        inline fn getPrivilege(self: *Self) arch.PrivilegeLevel {
-            if (comptime config.enable_privilege) {
-                return self.registers.privilege.sanitize();
+        inline fn getPrivilege(this: *Self) arch.PrivilegeLevel {
+            if (comptime config.runtime.enable_privilege) {
+                return this.registers.privilege.sanitize();
             } else {
-                return config.effective_privilege;
+                return config.runtime.effective_privilege;
             }
         }
 
@@ -224,9 +248,11 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
         }
 
         pub inline fn readMemory(this: *Self, address: u32, comptime T: type, comptime access: arch.Registers.Pmp.AccessType) MemoryError!T {
+            @setEvalBranchQuota(std.math.maxInt(u32));
+
             const byte_len = @sizeOf(T);
 
-            if (comptime config.enable_pmp) {
+            if (comptime config.runtime.enable_pmp) {
                 if (!this.registers.checkPmpAccess(address, access)) {
                     return MemoryError.PmpViolation;
                 }
@@ -236,7 +262,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 return MemoryError.AddressOutOfBounds;
             }
 
-            if (comptime config.enable_memory_alignment) {
+            if (comptime config.runtime.enable_memory_alignment) {
                 if (address % byte_len != 0) {
                     return MemoryError.MisalignedAddress;
                 }
@@ -248,10 +274,12 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
         }
 
         pub inline fn writeMemory(this: *Self, address: u32, value: anytype) MemoryError!void {
+            @setEvalBranchQuota(std.math.maxInt(u32));
+
             const T = @TypeOf(value);
             const byte_len = @sizeOf(T);
 
-            if (comptime config.enable_pmp) {
+            if (comptime config.runtime.enable_pmp) {
                 if (!this.registers.checkPmpAccess(address, .write)) {
                     return MemoryError.PmpViolation;
                 }
@@ -261,7 +289,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 return MemoryError.AddressOutOfBounds;
             }
 
-            if (comptime config.enable_memory_alignment) {
+            if (comptime config.runtime.enable_memory_alignment) {
                 if (address % byte_len != 0) {
                     return MemoryError.MisalignedAddress;
                 }
@@ -272,13 +300,15 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
         }
 
         inline fn fetch(this: *Self) FetchError!arch.Instruction {
+            @setEvalBranchQuota(std.math.maxInt(u32));
+
             const raw = try this.readMemory(this.registers.pc, u32, .execute);
 
             return arch.Instruction.decode(raw);
         }
 
         inline fn incCounters(this: *Self, comptime is_retired: bool) void {
-            if (comptime config.enable_counters) {
+            if (comptime config.runtime.enable_counters) {
                 this.registers.cycle +%= 1;
 
                 if (is_retired) {
@@ -336,7 +366,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
         }
 
         inline fn executeMret(this: *Self) State {
-            if (comptime config.enable_privilege) {
+            if (comptime config.runtime.enable_privilege) {
                 // mret is only valid in M-mode
                 if (this.registers.privilege != .machine) {
                     return trapState(.illegal_instruction, 0);
@@ -356,10 +386,10 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
         }
 
         pub inline fn checkInterrupts(this: *Self) ?arch.Registers.Mcause.Interrupt {
-            if (comptime !config.enable_interrupts) {
+            if (comptime !config.runtime.enable_interrupts) {
                 return null;
             }
-            
+
             const priv = this.registers.privilege.sanitize();
 
             const can_interrupt = this.registers.mstatus.mie or (priv == .user);
@@ -388,9 +418,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
             return null;
         }
 
-        inline fn execute(this: *Self, instruction: arch.Instruction) State {
-            @setEvalBranchQuota(std.math.maxInt(u32));
-
+        fn execute(this: *Self, instruction: arch.Instruction) State {
             switch (instruction) {
                 .lui => |i| {
                     this.registers.set(i.rd, @as(i32, i.imm) << 12);
@@ -406,7 +434,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const target = this.registers.pc +% offset;
 
-                    if (comptime config.enable_branch_alignment) {
+                    if (comptime config.runtime.enable_branch_alignment) {
                         if (target % 4 != 0) {
                             this.incCounters(true);
 
@@ -420,7 +448,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .jalr => |i| {
                     const target: u32 = @bitCast((this.registers.get(i.rs1) +% i.imm) & ~@as(i32, 1));
 
-                    if (comptime config.enable_branch_alignment) {
+                    if (comptime config.runtime.enable_branch_alignment) {
                         if (target % 4 != 0) {
                             this.incCounters(true);
 
@@ -436,7 +464,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
                         const target = this.registers.pc +% offset;
 
-                        if (comptime config.enable_branch_alignment) {
+                        if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
                                 this.incCounters(true);
 
@@ -454,7 +482,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
                         const target = this.registers.pc +% offset;
 
-                        if (comptime config.enable_branch_alignment) {
+                        if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
                                 this.incCounters(true);
 
@@ -472,7 +500,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
                         const target = this.registers.pc +% offset;
 
-                        if (comptime config.enable_branch_alignment) {
+                        if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
                                 this.incCounters(true);
 
@@ -490,7 +518,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
                         const target = this.registers.pc +% offset;
 
-                        if (comptime config.enable_branch_alignment) {
+                        if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
                                 this.incCounters(true);
 
@@ -511,7 +539,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
                         const target = this.registers.pc +% offset;
 
-                        if (comptime config.enable_branch_alignment) {
+                        if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
                                 this.incCounters(true);
 
@@ -532,7 +560,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         const offset: u32 = @bitCast(@as(i32, i.imm));
                         const target = this.registers.pc +% offset;
 
-                        if (comptime config.enable_branch_alignment) {
+                        if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
                                 this.incCounters(true);
 
@@ -753,19 +781,19 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .ecall => {
-                    const cause: arch.Registers.Mcause.Exception = if (comptime config.enable_privilege)
+                    const cause: arch.Registers.Mcause.Exception = if (comptime config.runtime.enable_privilege)
                         switch (this.registers.privilege.sanitize()) {
                             .user => .ecall_from_u,
                             .machine => .ecall_from_m,
                             _ => .ecall_from_m,
                         }
-                    else switch (config.effective_privilege) {
+                    else switch (config.runtime.effective_privilege) {
                         .user => .ecall_from_u,
                         .machine => .ecall_from_m,
                         _ => .ecall_from_m,
                     };
 
-                    if (!hooks.ecall(@ptrCast(this))) {
+                    if (!config.hooks.ecall(@ptrCast(this))) {
                         this.incCounters(true);
 
                         return trapState(cause, 0);
@@ -774,7 +802,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .ebreak => {
-                    if (!hooks.ebreak(@ptrCast(this))) {
+                    if (!config.hooks.ebreak(@ptrCast(this))) {
                         this.incCounters(true);
 
                         return trapState(.breakpoint, this.registers.pc); // breakpoint: mtval = PC
@@ -783,7 +811,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .mul => |i| {
-                    if (comptime !config.enable_m_ext) {
+                    if (comptime !config.runtime.enable_m_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -793,7 +821,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .mulh => |i| {
-                    if (comptime !config.enable_m_ext) {
+                    if (comptime !config.runtime.enable_m_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -806,7 +834,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .mulhsu => |i| {
-                    if (comptime !config.enable_m_ext) {
+                    if (comptime !config.runtime.enable_m_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -820,7 +848,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .mulhu => |i| {
-                    if (comptime !config.enable_m_ext) {
+                    if (comptime !config.runtime.enable_m_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -833,7 +861,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .div => |i| {
-                    if (comptime !config.enable_m_ext) {
+                    if (comptime !config.runtime.enable_m_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -852,7 +880,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .divu => |i| {
-                    if (comptime !config.enable_m_ext) {
+                    if (comptime !config.runtime.enable_m_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -870,7 +898,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .rem => |i| {
-                    if (comptime !config.enable_m_ext) {
+                    if (comptime !config.runtime.enable_m_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -890,7 +918,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .remu => |i| {
-                    if (comptime !config.enable_m_ext) {
+                    if (comptime !config.runtime.enable_m_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -938,7 +966,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2))
                         {
@@ -959,7 +987,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     const result = rs1 + rs2;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
                             this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
@@ -985,7 +1013,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2))
                         {
@@ -1004,7 +1032,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     const result = rs1 - rs2;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
                             this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
@@ -1030,7 +1058,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2))
                         {
@@ -1049,7 +1077,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     const result = rs1 * rs2;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
                             this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
@@ -1079,7 +1107,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2))
                         {
@@ -1102,7 +1130,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     const result = rs1 / rs2;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isInf(result) and !std.math.isInf(rs1) and rs2 != 0) {
                             this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
@@ -1127,7 +1155,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .fsqrt_s => |i| {
                     const rs1 = this.registers.getF32(i.rs1);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1)) {
                             this.registers.fcsr.nv = true;
                         }
@@ -1156,7 +1184,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2))
                         {
@@ -1186,7 +1214,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2))
                         {
@@ -1240,7 +1268,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2))
                         {
@@ -1262,7 +1290,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
                             this.registers.fcsr.nv = true;
                             this.registers.set(i.rd, 0);
@@ -1280,7 +1308,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF32(i.rs1);
                     const rs2 = this.registers.getF32(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
                             this.registers.fcsr.nv = true;
                             this.registers.set(i.rd, 0);
@@ -1300,7 +1328,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     var result: i32 = undefined;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         var invalid = false;
 
                         if (std.math.isNan(rs1)) {
@@ -1348,7 +1376,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     var result: u32 = undefined;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         var invalid = false;
 
                         if (std.math.isNan(rs1)) {
@@ -1394,7 +1422,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.get(i.rs1);
                     const result: f32 = @floatFromInt(rs1);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (@as(i32, @intFromFloat(result)) != rs1) {
                             this.registers.fcsr.nx = true;
                         }
@@ -1407,7 +1435,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1: u32 = @bitCast(this.registers.get(i.rs1));
                     const result: f32 = @floatFromInt(rs1);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (@as(u32, @intFromFloat(result)) != rs1) {
                             this.registers.fcsr.nx = true;
                         }
@@ -1459,7 +1487,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs2 = this.registers.getF32(i.rs2);
                     const rs3 = this.registers.getF32(i.rs3);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2) or
                             arch.FloatHelpers.isSignalingNanF32(rs3))
@@ -1480,7 +1508,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const result = @mulAdd(f32, rs1, rs2, rs3);
 
                     if (std.math.isNan(result)) {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             // If result is NaN but no input was NaN, it's an invalid operation
                             // (e.g., inf + (-inf) from the fused operation)
                             if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
@@ -1490,7 +1518,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                         this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                     } else {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1) and
                                 !std.math.isInf(rs2) and
@@ -1511,7 +1539,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs2 = this.registers.getF32(i.rs2);
                     const rs3 = this.registers.getF32(i.rs3);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2) or
                             arch.FloatHelpers.isSignalingNanF32(rs3))
@@ -1532,7 +1560,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const result = @mulAdd(f32, rs1, rs2, -rs3);
 
                     if (std.math.isNan(result)) {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
                                 this.registers.fcsr.nv = true;
                             }
@@ -1540,7 +1568,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                         this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                     } else {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1) and
                                 !std.math.isInf(rs2) and
@@ -1561,7 +1589,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs2 = this.registers.getF32(i.rs2);
                     const rs3 = this.registers.getF32(i.rs3);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2) or
                             arch.FloatHelpers.isSignalingNanF32(rs3))
@@ -1582,7 +1610,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const result = @mulAdd(f32, -rs1, rs2, rs3);
 
                     if (std.math.isNan(result)) {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
                                 this.registers.fcsr.nv = true;
                             }
@@ -1590,7 +1618,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                         this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                     } else {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1) and
                                 !std.math.isInf(rs2) and
@@ -1611,7 +1639,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs2 = this.registers.getF32(i.rs2);
                     const rs3 = this.registers.getF32(i.rs3);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1) or
                             arch.FloatHelpers.isSignalingNanF32(rs2) or
                             arch.FloatHelpers.isSignalingNanF32(rs3))
@@ -1632,7 +1660,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const result = @mulAdd(f32, -rs1, rs2, -rs3);
 
                     if (std.math.isNan(result)) {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
                                 this.registers.fcsr.nv = true;
                             }
@@ -1640,7 +1668,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                         this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                     } else {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1) and
                                 !std.math.isInf(rs2) and
@@ -1686,7 +1714,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2))
                         {
@@ -1712,7 +1740,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or arch.FloatHelpers.isSignalingNanF64(rs2)) {
                             this.registers.fcsr.nv = true;
                         }
@@ -1730,7 +1758,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     const result = rs1 - rs2;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isInf(result) and
                             !std.math.isInf(rs1) and
                             !std.math.isInf(rs2))
@@ -1751,7 +1779,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2))
                         {
@@ -1771,7 +1799,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     const result = rs1 * rs2;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isInf(result) and
                             !std.math.isInf(rs1) and
                             !std.math.isInf(rs2))
@@ -1792,7 +1820,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2))
                         {
@@ -1819,7 +1847,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                     const result = rs1 / rs2;
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isInf(result) and !std.math.isInf(rs1) and rs2 != 0) {
                             this.registers.fcsr.of = true;
                             this.registers.fcsr.nx = true;
@@ -1836,7 +1864,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .fsqrt_d => |i| {
                     const rs1 = this.registers.getF64(i.rs1);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1)) {
                             this.registers.fcsr.nv = true;
                         }
@@ -1867,7 +1895,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2))
                         {
@@ -1897,7 +1925,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2))
                         {
@@ -1952,7 +1980,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         // feq: only sNaN sets NV
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2))
@@ -1976,7 +2004,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         // flt/fle: any NaN sets NV
                         if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
                             this.registers.fcsr.nv = true;
@@ -1995,7 +2023,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs1 = this.registers.getF64(i.rs1);
                     const rs2 = this.registers.getF64(i.rs2);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
                             this.registers.fcsr.nv = true;
                             this.registers.set(i.rd, 0);
@@ -2041,7 +2069,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         } else {
                             result = @intFromFloat(rounded);
 
-                            if (comptime config.enable_fpu_flags) {
+                            if (comptime config.runtime.enable_fpu_flags) {
                                 if (rounded != rs1) {
                                     this.registers.fcsr.nx = true;
                                 }
@@ -2049,7 +2077,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         }
                     }
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (invalid) {
                             this.registers.fcsr.nv = true;
                         }
@@ -2090,7 +2118,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         } else {
                             result = @intFromFloat(rounded);
 
-                            if (comptime config.enable_fpu_flags) {
+                            if (comptime config.runtime.enable_fpu_flags) {
                                 if (rounded != rs1) {
                                     this.registers.fcsr.nx = true;
                                 }
@@ -2098,7 +2126,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                         }
                     }
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (invalid) {
                             this.registers.fcsr.nv = true;
                         }
@@ -2154,7 +2182,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs2 = this.registers.getF64(i.rs2);
                     const rs3 = this.registers.getF64(i.rs3);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2) or
                             arch.FloatHelpers.isSignalingNanF64(rs3))
@@ -2180,7 +2208,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     if (std.math.isNan(result)) {
                         this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
                     } else {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1) and
                                 !std.math.isInf(rs2) and
@@ -2201,7 +2229,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs2 = this.registers.getF64(i.rs2);
                     const rs3 = this.registers.getF64(i.rs3);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2) or
                             arch.FloatHelpers.isSignalingNanF64(rs3))
@@ -2222,7 +2250,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const result = @mulAdd(f64, rs1, rs2, -rs3);
 
                     if (std.math.isNan(result)) {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
                                 this.registers.fcsr.nv = true;
                             }
@@ -2230,7 +2258,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                         this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
                     } else {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1) and
                                 !std.math.isInf(rs2) and
@@ -2251,7 +2279,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs2 = this.registers.getF64(i.rs2);
                     const rs3 = this.registers.getF64(i.rs3);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2) or
                             arch.FloatHelpers.isSignalingNanF64(rs3))
@@ -2272,7 +2300,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const result = @mulAdd(f64, -rs1, rs2, rs3);
 
                     if (std.math.isNan(result)) {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
                                 this.registers.fcsr.nv = true;
                             }
@@ -2280,7 +2308,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                         this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
                     } else {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1) and
                                 !std.math.isInf(rs2) and
@@ -2301,7 +2329,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const rs2 = this.registers.getF64(i.rs2);
                     const rs3 = this.registers.getF64(i.rs3);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1) or
                             arch.FloatHelpers.isSignalingNanF64(rs2) or
                             arch.FloatHelpers.isSignalingNanF64(rs3))
@@ -2322,7 +2350,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const result = @mulAdd(f64, -rs1, rs2, -rs3);
 
                     if (std.math.isNan(result)) {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
                                 this.registers.fcsr.nv = true;
                             }
@@ -2330,7 +2358,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
 
                         this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
                     } else {
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1) and
                                 !std.math.isInf(rs2) and
@@ -2349,7 +2377,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .fcvt_s_d => |i| {
                     const rs1 = this.registers.getF64(i.rs1);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF64(rs1)) {
                             this.registers.fcsr.nv = true;
                         }
@@ -2360,7 +2388,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     } else {
                         const result: f32 = @floatCast(rs1);
 
-                        if (comptime config.enable_fpu_flags) {
+                        if (comptime config.runtime.enable_fpu_flags) {
                             if (std.math.isInf(result) and
                                 !std.math.isInf(rs1))
                             {
@@ -2385,7 +2413,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .fcvt_d_s => |i| {
                     const rs1 = this.registers.getF32(i.rs1);
 
-                    if (comptime config.enable_fpu_flags) {
+                    if (comptime config.runtime.enable_fpu_flags) {
                         if (arch.FloatHelpers.isSignalingNanF32(rs1)) {
                             this.registers.fcsr.nv = true;
                         }
@@ -2403,7 +2431,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
                     const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
 
-                    if (comptime config.enable_csr_checks) {
+                    if (comptime config.runtime.enable_csr_checks) {
                         if (i.rd != 0) {
                             const old = this.registers.readCsr(csr) catch {
                                 this.incCounters(true);
@@ -2434,7 +2462,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .csrrs => |i| {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    if (comptime config.enable_csr_checks) {
+                    if (comptime config.runtime.enable_csr_checks) {
                         const old = this.registers.readCsr(csr) catch {
                             this.incCounters(true);
 
@@ -2469,7 +2497,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .csrrc => |i| {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    if (comptime config.enable_csr_checks) {
+                    if (comptime config.runtime.enable_csr_checks) {
                         const old = this.registers.readCsr(csr) catch {
                             this.incCounters(true);
 
@@ -2504,7 +2532,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .csrrwi => |i| {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    if (comptime config.enable_csr_checks) {
+                    if (comptime config.runtime.enable_csr_checks) {
                         if (i.rd != 0) {
                             const old = this.registers.readCsr(csr) catch {
                                 this.incCounters(true);
@@ -2535,7 +2563,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .csrrsi => |i| {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    if (comptime config.enable_csr_checks) {
+                    if (comptime config.runtime.enable_csr_checks) {
                         const old = this.registers.readCsr(csr) catch {
                             this.incCounters(true);
 
@@ -2566,7 +2594,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                 .csrrci => |i| {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
-                    if (comptime config.enable_csr_checks) {
+                    if (comptime config.runtime.enable_csr_checks) {
                         const old = this.registers.readCsr(csr) catch {
                             this.incCounters(true);
 
@@ -2598,7 +2626,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .sh1add => |i| {
-                    if (comptime !config.enable_zba_ext) {
+                    if (comptime !config.runtime.enable_zba_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -2611,7 +2639,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .sh2add => |i| {
-                    if (comptime !config.enable_zba_ext) {
+                    if (comptime !config.runtime.enable_zba_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -2624,7 +2652,7 @@ pub inline fn Cpu(comptime hooks: Hooks, comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .sh3add => |i| {
-                    if (comptime !config.enable_zba_ext) {
+                    if (comptime !config.runtime.enable_zba_ext) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -2828,7 +2856,7 @@ fn configurePmpFullAccess(cpu: *TestCpu) void {
     }));
 }
 
-const TestCpu = Cpu(.{}, .compliant);
+const TestCpu = Cpu(.{ .runtime = .compliant, .compile = .fast_compile });
 
 test "x0 register is always zero" {
     var ram = initRamWithCode(1024, &.{

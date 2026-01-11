@@ -1245,6 +1245,8 @@ pub const Instruction = union(enum) {
     }
 
     pub inline fn decode(from: u32) DecodeError!Instruction {
+        @setEvalBranchQuota(std.math.maxInt(u32));
+
         const opcode = decodeOpcode(from);
         const funct3 = decodeFunct3(from);
         const funct7 = decodeFunct7(from);

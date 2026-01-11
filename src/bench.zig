@@ -272,7 +272,7 @@ pub fn main() !void {
 }
 
 /// Like `.fast` but with enabled counters of course!
-const FAST: ondatra.cpu.Config = .{
+const FAST: ondatra.cpu.Config.Runtime = .{
     .enable_pmp = false,
     .enable_memory_alignment = false,
     .enable_privilege = false,
@@ -294,15 +294,19 @@ const floatArithmeticFastBenchmark = MakeBenchmark("float_arithmetic.bin", FAST)
 const floatSqrtFmaCompilantBenchmark = MakeBenchmark("float_sqrt_fma.bin", .compliant);
 const floatSqrtFmaFastBenchmark = MakeBenchmark("float_sqrt_fma.bin", FAST);
 
-fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Config) Benchmark.Func {
+fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Config.Runtime) Benchmark.Func {
     return struct {
         fn func(allocator: std.mem.Allocator, r: *Runner) bool {
             const PROGRAM = @embedFile(program);
 
             const State = struct {
                 const Cpu = ondatra.cpu.Cpu(.{
-                    .ecall = ecall,
-                }, config);
+                    .hooks = .{
+                        .ecall = ecall,
+                    },
+                    .runtime = config,
+                    .compile = .fast_execution,
+                });
 
                 over: bool = false,
                 cpu: Cpu,
