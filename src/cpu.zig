@@ -20,8 +20,8 @@ pub const Config = struct {
         /// Return true to continue, false to halt.
         wfi: ?*const fn (cpu: *anyopaque) callconv(.@"inline") bool = null,
         isMmio: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") bool = null,
-        read: ?*const fn (cpu: *anyopaque, address: u32, dst: []u8) callconv(.@"inline") bool = null,
-        write: ?*const fn (cpu: *anyopaque, address: u32, src: []const u8) callconv(.@"inline") bool = null,
+        read: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") ?u8 = null,
+        write: ?*const fn (cpu: *anyopaque, address: u32, value: u8) callconv(.@"inline") bool = null,
         readTranslate: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") u32 = null,
         writeTranslate: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") u32 = null,
     };
@@ -304,13 +304,13 @@ pub inline fn Cpu(comptime config: Config) type {
         pub inline fn readMemory(this: *Self, address: u32, comptime T: type, comptime access: arch.Registers.Pmp.AccessType) MemoryError!T {
             @setEvalBranchQuota(std.math.maxInt(u32));
 
+            const byte_len = @sizeOf(T);
+
             if (comptime config.runtime.enable_pmp) {
-                if (!this.registers.checkPmpAccess(address, access, this.getPrivilege())) {
+                if (!this.registers.checkPmpAccess(address, byte_len, access, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
                 }
             }
-
-            const byte_len = @sizeOf(T);
 
             if (comptime config.runtime.enable_memory_alignment) {
                 if (address % byte_len != 0) {
@@ -322,11 +322,15 @@ pub inline fn Cpu(comptime config: Config) type {
                 if (config.hooks.isMmio.?(this, address)) {
                     var dst: [byte_len]u8 = undefined;
 
-                    if (config.hooks.read.?(this, address, &dst)) {
-                        return std.mem.bytesToValue(T, &dst);
-                    } else {
-                        return MemoryError.ReadFailed;
+                    inline for (0..byte_len) |i| {
+                        if (config.hooks.read.?(this, address +% @as(u32, @intCast(i)))) |value| {
+                            dst[i] = value;
+                        } else {
+                            return MemoryError.ReadFailed;
+                        }
                     }
+
+                    return std.mem.bytesToValue(T, &dst);
                 }
             }
 
@@ -347,14 +351,14 @@ pub inline fn Cpu(comptime config: Config) type {
         pub inline fn writeMemory(this: *Self, address: u32, value: anytype) MemoryError!void {
             @setEvalBranchQuota(std.math.maxInt(u32));
 
+            const T = @TypeOf(value);
+            const byte_len = @sizeOf(T);
+
             if (comptime config.runtime.enable_pmp) {
-                if (!this.registers.checkPmpAccess(address, .write, this.getPrivilege())) {
+                if (!this.registers.checkPmpAccess(address, byte_len, .write, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
                 }
             }
-
-            const T = @TypeOf(value);
-            const byte_len = @sizeOf(T);
 
             if (comptime config.runtime.enable_memory_alignment) {
                 if (address % byte_len != 0) {
@@ -366,8 +370,10 @@ pub inline fn Cpu(comptime config: Config) type {
                 if (config.hooks.isMmio.?(this, address)) {
                     const src = std.mem.asBytes(&value);
 
-                    if (!config.hooks.write.?(this, address, src)) {
-                        return MemoryError.WriteFailed;
+                    inline for (0..byte_len) |i| {
+                        if (!config.hooks.write.?(this, address +% @as(u32, @intCast(i)), src[i])) {
+                            return MemoryError.WriteFailed;
+                        }
                     }
 
                     return;
@@ -8398,4 +8404,278 @@ test "mie and mip bitcast sanity check" {
     try std.testing.expectEqual(@as(u32, 0x80), mie_val); // Bit 7
     try std.testing.expectEqual(@as(u32, 0x80), mip_val); // Bit 7
     try std.testing.expectEqual(@as(u32, 0x80), mie_val & mip_val);
+}
+
+test "PMP denies access crossing region boundary" {
+    // Test 1: Write u32 completely inside region - should succeed
+    var instr_ram = initRamWithCode(1024, &.{
+        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
+    });
+    var test_cpu: TestCpu = .init(&instr_ram);
+    test_cpu.registers.privilege = .user;
+    test_cpu.registers.set(1, 0x120); // Address inside data region
+    test_cpu.registers.set(2, 0x12345678);
+
+    // Configure PMP for DATA region: 0x100-0x200 (256 bytes), RW
+    test_cpu.registers.pmpaddr[0] = 0x5F; // NAPOT 0x100-0x200
+    test_cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = false, // Data, not code
+        .a = .napot,
+    }));
+
+    // Configure PMP for CODE region - MUST be done for U-mode!
+    configurePmpForCode(&test_cpu);
+
+    try std.testing.expectEqual(TestCpu.State.ok, test_cpu.step());
+
+    // Test 2: Write u32 crossing END of region (0x1FE-0x202) - should fail
+    var instr_ram2 = initRamWithCode(1024, &.{
+        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
+    });
+    var test_cpu2: TestCpu = .init(&instr_ram2);
+    test_cpu2.registers.privilege = .user;
+    test_cpu2.registers.set(1, 0x1FE); // Crosses boundary: 0x1FE + 4 = 0x202 > 0x200
+    test_cpu2.registers.set(2, 0x12345678);
+
+    test_cpu2.registers.pmpaddr[0] = 0x5F;
+    test_cpu2.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = false,
+        .a = .napot,
+    }));
+    configurePmpForCode(&test_cpu2);
+
+    const state2 = test_cpu2.step();
+    try std.testing.expect(state2 == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state2.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 0x1FE), state2.trap.tval);
+}
+
+test "PMP denies access crossing region START boundary" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // Region: 0x100-0x200
+    cpu.registers.pmpaddr[0] = 0x5F; // NAPOT 0x100-0x200
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+
+    // Write u32 crossing START of region (0xFE-0x102) - should fail
+    cpu.registers.set(1, 0xFE);
+    cpu.registers.set(2, @truncate(0xDEADBEEF));
+
+    var instr_ram = initRamWithCode(1024, &.{
+        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
+    });
+    var test_cpu: TestCpu = .init(&instr_ram);
+    test_cpu.registers = cpu.registers;
+    configurePmpForCode(&test_cpu);
+
+    const state = test_cpu.step();
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state.trap.cause.exception);
+}
+
+test "PMP allows access fully within region" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // Region: 0x100-0x200, RWX
+    cpu.registers.pmpaddr[0] = 0x5F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+
+    // Test all sizes at various alignments inside region
+    const test_cases = [_]struct { addr: u32, size: u32 }{
+        .{ .addr = 0x100, .size = 1 }, // First byte
+        .{ .addr = 0x1FF, .size = 1 }, // Last byte
+        .{ .addr = 0x100, .size = 2 }, // First halfword
+        .{ .addr = 0x1FE, .size = 2 }, // Last halfword
+        .{ .addr = 0x100, .size = 4 }, // First word
+        .{ .addr = 0x1FC, .size = 4 }, // Last word
+        .{ .addr = 0x100, .size = 8 }, // First doubleword
+        .{ .addr = 0x1F8, .size = 8 }, // Last doubleword
+        .{ .addr = 0x150, .size = 4 }, // Middle
+    };
+
+    for (test_cases) |tc| {
+        const result = cpu.registers.checkPmpAccess(tc.addr, tc.size, .write, .user);
+        try std.testing.expect(result);
+    }
+}
+
+test "PMP denies access partially overlapping region" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // Region: 0x100-0x200
+    cpu.registers.pmpaddr[0] = 0x5F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+
+    // Test cases that cross boundaries
+    const test_cases = [_]struct { addr: u32, size: u32 }{
+        .{ .addr = 0xFE, .size = 4 }, // Crosses start: 0xFE-0x102
+        .{ .addr = 0xFF, .size = 2 }, // Crosses start: 0xFF-0x101
+        .{ .addr = 0x1FE, .size = 4 }, // Crosses end: 0x1FE-0x202
+        .{ .addr = 0x1FF, .size = 2 }, // Crosses end: 0x1FF-0x201
+        .{ .addr = 0x1FD, .size = 8 }, // Crosses end: 0x1FD-0x205
+        .{ .addr = 0xFC, .size = 8 }, // Crosses start: 0xFC-0x104
+    };
+
+    for (test_cases) |tc| {
+        const result = cpu.registers.checkPmpAccess(tc.addr, tc.size, .write, .user);
+        try std.testing.expectEqual(false, result);
+    }
+}
+
+test "PMP TOR mode boundary crossing" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // TOR mode: region from 0x100 to 0x200
+    // pmpaddr[0] = upper bound >> 2
+    cpu.registers.pmpaddr[0] = 0x200 >> 2; // 0x80
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .tor,
+    }));
+    // Previous address (implicit 0 or pmpaddr[-1]) is 0, so region is [0, 0x200)
+
+    // Access at end boundary should fail if it crosses
+    const result1 = cpu.registers.checkPmpAccess(0x1FC, 8, .write, .user); // 0x1FC-0x204 crosses 0x200
+    try std.testing.expectEqual(false, result1);
+
+    // Access fully inside should succeed
+    const result2 = cpu.registers.checkPmpAccess(0x1F8, 8, .write, .user); // 0x1F8-0x200 is inside
+    try std.testing.expect(result2);
+}
+
+test "PMP u64 load/store boundary check" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .fld = .{ .rd = 0, .rs1 = 1, .imm = 0 } }, // Load 8 bytes
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+    cpu.registers.mstatus.fs = 0b01; // Enable FPU
+
+    // Region: 0x100-0x200
+    cpu.registers.pmpaddr[0] = 0x5F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+    configurePmpForCode(&cpu);
+
+    // fld from 0x1FC should fail (0x1FC + 8 = 0x204 > 0x200)
+    cpu.registers.set(1, 0x1FC);
+
+    const state = cpu.step();
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_access_fault, state.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 0x1FC), state.trap.tval);
+}
+
+test "PMP u16 store boundary check" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .sh = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } }, // Store 2 bytes
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // Region: 0x100-0x200
+    cpu.registers.pmpaddr[0] = 0x5F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+    configurePmpForCode(&cpu);
+
+    // sh to 0x1FF should fail (0x1FF + 2 = 0x201 > 0x200)
+    cpu.registers.set(1, 0x1FF);
+    cpu.registers.set(2, 0x1234);
+
+    const state = cpu.step();
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state.trap.cause.exception);
+}
+
+test "PMP multiple regions - access must be in single region" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // Region 0: 0x100-0x180 (128 bytes)
+    cpu.registers.pmpaddr[0] = 0x4F; // (0x100 >> 2) | 0x0F = 0x40 | 0x0F
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = false,
+        .a = .napot,
+    }));
+
+    // Region 1: 0x180-0x200 (128 bytes)
+    cpu.registers.pmpaddr[1] = 0x6F; // (0x180 >> 2) | 0x0F = 0x60 | 0x0F
+    cpu.registers.pmpcfg[0] |= @as(u32, @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = false,
+        .a = .napot,
+    }))) << 8;
+
+    // Access spanning both regions (0x17C-0x184) - should fail even though both have RW
+    // Because the access must be fully contained in ONE region
+    const result = cpu.registers.checkPmpAccess(0x17C, 8, .write, .user);
+    try std.testing.expectEqual(false, result);
+
+    // Access fully in region 0 - should succeed
+    const result2 = cpu.registers.checkPmpAccess(0x170, 8, .write, .user);
+    try std.testing.expect(result2);
+
+    // Access fully in region 1 - should succeed
+    const result3 = cpu.registers.checkPmpAccess(0x188, 8, .write, .user);
+    try std.testing.expect(result3);
+}
+
+fn configurePmpForCode(cpu: *TestCpu) void {
+    // PMP entry for code at 0x000-0x100 (where initRamWithCode places instructions)
+    // Use entry 15 to not conflict with data region at entry 0
+    // NAPOT: 256 bytes, pmpaddr = (0 >> 2) | (256/8 - 1) = 0 | 0x1F = 0x1F
+    cpu.registers.pmpaddr[15] = 0x1F;
+
+    const cfg = arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true, // Execute permission!
+        .a = .napot,
+    };
+
+    // Entry 15 is in pmpcfg[3], byte 3
+    cpu.registers.pmpcfg[3] = (cpu.registers.pmpcfg[3] & 0x00FFFFFF) |
+        (@as(u32, @as(u8, @bitCast(cfg))) << 24);
 }

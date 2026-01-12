@@ -398,22 +398,33 @@ pub const Registers = struct {
                     const trailing_ones = @ctz(~addr);
                     const clamped = if (trailing_ones > 31) 31 else trailing_ones;
                     const range_size: u34 = @as(u34, 8) << @intCast(clamped);
-                    const base = (@as(u34, addr) & ~(range_size / 4 - 1)) << 2;
+                    const mask = range_size / 4 - 1;
+                    const base = (@as(u34, addr) & ~mask) << 2;
 
                     break :blk .{ .start = base, .end = base + range_size };
                 },
             };
         }
 
-        pub inline fn checkAccess(cfg: PmpCfg, addr: u32, prev_addr: u32, access_addr: u32, access_type: AccessType) MatchResult {
+        /// Check if entire range [access_addr, access_addr + size) is covered by this PMP entry
+        pub inline fn checkAccess(
+            cfg: PmpCfg,
+            pmpaddr: u32,
+            prev_addr: u32,
+            access_addr: u32,
+            access_size: u32,
+            access_type: AccessType,
+        ) MatchResult {
             if (cfg.a == .off) {
                 return .no_match;
             }
 
-            const range = getRange(cfg, addr, prev_addr);
-            const check_addr: u34 = access_addr;
+            const range = getRange(cfg, pmpaddr, prev_addr);
+            const access_start: u34 = access_addr;
+            const access_end: u34 = access_addr + access_size;
 
-            if (check_addr >= range.start and check_addr < range.end) {
+            // Check if entire access range is within PMP region
+            if (access_start >= range.start and access_end <= range.end) {
                 const allowed = switch (access_type) {
                     .read => cfg.r,
                     .write => cfg.w,
@@ -421,6 +432,13 @@ pub const Registers = struct {
                 };
 
                 return if (allowed) .match_allowed else .match_denied;
+            }
+
+            // Partial overlap - access crosses region boundary
+            if (access_start < range.end and access_end > range.start) {
+                // Access partially overlaps with region - this is a boundary crossing
+                // For safety, we deny such accesses (they need to be fully contained)
+                return .match_denied;
             }
 
             return .no_match;
@@ -596,17 +614,25 @@ pub const Registers = struct {
         this.pmpcfg[cfg_reg] = (this.pmpcfg[cfg_reg] & ~mask) | (@as(u8, @bitCast(cfg)) << cfg_offset);
     }
 
-    pub inline fn checkPmpAccess(this: *Registers, addr: u32, access_type: Pmp.AccessType, priv: PrivilegeLevel) bool {
+    /// Check PMP access for a range of addresses
+    /// size: 1, 2, 4, or 8 bytes
+    pub inline fn checkPmpAccess(
+        this: *Registers,
+        addr: u32,
+        size: u32,
+        access_type: Pmp.AccessType,
+        priv: PrivilegeLevel,
+    ) bool {
         // MPRV only affects load/store, not instruction fetch (execute)
-        const effective_priv: PrivilegeLevel = if (priv == .machine and this.mstatus.mprv and access_type != .execute)
+        const effective_priv: PrivilegeLevel = if (priv == .machine and
+            this.mstatus.mprv and
+            access_type != .execute)
             this.mstatus.mpp.sanitize()
         else
             priv;
 
-        // M-mode without MPRV bypasses PMP unless L bit is set
-        if (effective_priv == .machine and !this.mstatus.mprv) {
-            // Still check locked entries
-            var matched_locked = false;
+        // M-mode bypasses PMP unless L bit is set
+        if (effective_priv == .machine and !(this.mstatus.mprv and access_type != .execute)) {
             var prev_addr: u32 = 0;
 
             inline for (0..Pmp.NUM_REGIONS) |i| {
@@ -614,14 +640,10 @@ pub const Registers = struct {
                 const pmpaddr = this.pmpaddr[i];
 
                 if (cfg.isLocked()) {
-                    const result = Pmp.checkAccess(cfg, pmpaddr, prev_addr, addr, access_type);
+                    const result = Pmp.checkAccess(cfg, pmpaddr, prev_addr, addr, size, access_type);
 
                     if (result == .match_denied) {
                         return false;
-                    }
-
-                    if (result == .match_allowed) {
-                        matched_locked = true;
                     }
                 }
 
@@ -631,14 +653,14 @@ pub const Registers = struct {
             return true;
         }
 
-        // U-mode or M-mode with MPRV must pass PMP check
+        // U-mode or M-mode with MPRV
         var prev_addr: u32 = 0;
 
         inline for (0..Pmp.NUM_REGIONS) |i| {
             const cfg = this.getPmpCfg(i);
             const pmpaddr = this.pmpaddr[i];
 
-            const result = Pmp.checkAccess(cfg, pmpaddr, prev_addr, addr, access_type);
+            const result = Pmp.checkAccess(cfg, pmpaddr, prev_addr, addr, size, access_type);
 
             switch (result) {
                 .match_allowed => return true,
@@ -649,7 +671,7 @@ pub const Registers = struct {
             prev_addr = pmpaddr;
         }
 
-        // No PMP entry matched - denied for U-mode, allowed for M-mode
+        // No match - denied for U-mode
         return effective_priv == .machine;
     }
 
@@ -5474,4 +5496,68 @@ test "mstatus.mpp only accepts valid privilege levels" {
 
     // Should default to machine mode
     try std.testing.expectEqual(PrivilegeLevel.machine, regs.mstatus.mpp);
+}
+
+test "checkPmpAccess" {
+    var regs: Registers = .{};
+
+    // Setup: NAPOT region 0x1000-0x2000 (4KB), RW
+    // 4KB = 2^12, need 9 trailing 1s: pmpaddr = (0x1000 >> 2) | 0x1FF = 0x400 | 0x1FF = 0x5FF
+    regs.pmpaddr[0] = 0x5FF;
+    regs.pmpcfg[0] = @as(u8, @bitCast(Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+
+    // Inside region - various sizes
+    try std.testing.expect(regs.checkPmpAccess(0x1000, 1, .read, .user));
+    try std.testing.expect(regs.checkPmpAccess(0x1000, 4, .read, .user));
+    try std.testing.expect(regs.checkPmpAccess(0x1000, 8, .read, .user));
+    try std.testing.expect(regs.checkPmpAccess(0x1500, 256, .read, .user));
+    try std.testing.expect(regs.checkPmpAccess(0x1FFC, 4, .read, .user)); // Last word
+
+    // Crossing end boundary
+    try std.testing.expectEqual(false, regs.checkPmpAccess(0x1FFE, 4, .read, .user)); // 0x1FFE + 4 = 0x2002
+    try std.testing.expectEqual(false, regs.checkPmpAccess(0x1FFF, 2, .read, .user)); // 0x1FFF + 2 = 0x2001
+    try std.testing.expectEqual(false, regs.checkPmpAccess(0x1FF8, 16, .read, .user)); // 0x1FF8 + 16 = 0x2008
+
+    // Crossing start boundary
+    try std.testing.expectEqual(false, regs.checkPmpAccess(0x0FFE, 4, .read, .user)); // 0x0FFE + 4 = 0x1002
+    try std.testing.expectEqual(false, regs.checkPmpAccess(0x0FFF, 2, .read, .user)); // 0x0FFF + 2 = 0x1001
+
+    // Completely outside
+    try std.testing.expectEqual(false, regs.checkPmpAccess(0x0F00, 4, .read, .user));
+    try std.testing.expectEqual(false, regs.checkPmpAccess(0x2000, 4, .read, .user));
+}
+
+test "checkPmpAccess M-mode bypasses PMP" {
+    var regs: Registers = .{};
+
+    // No PMP configured - M-mode should still work
+    try std.testing.expect(regs.checkPmpAccess(0x1000, 8, .write, .machine));
+
+    // With PMP that denies access - M-mode still bypasses
+    regs.pmpaddr[0] = 0x5FF; // 0x1000-0x2000
+    regs.pmpcfg[0] = @as(u8, @bitCast(Registers.PmpCfg{
+        .r = false, // No read!
+        .w = false, // No write!
+        .x = false, // No execute!
+        .a = .napot,
+    }));
+
+    // M-mode bypasses
+    try std.testing.expect(regs.checkPmpAccess(0x1500, 4, .write, .machine));
+
+    // But locked entry blocks even M-mode
+    regs.pmpcfg[0] = @as(u8, @bitCast(Registers.PmpCfg{
+        .r = false,
+        .w = false,
+        .x = false,
+        .a = .napot,
+        .l = true, // LOCKED
+    }));
+
+    try std.testing.expectEqual(false, regs.checkPmpAccess(0x1500, 4, .write, .machine));
 }
