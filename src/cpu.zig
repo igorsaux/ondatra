@@ -304,7 +304,19 @@ pub inline fn Cpu(comptime config: Config) type {
         pub inline fn readMemory(this: *Self, address: u32, comptime T: type, comptime access: arch.Registers.Pmp.AccessType) MemoryError!T {
             @setEvalBranchQuota(std.math.maxInt(u32));
 
+            if (comptime config.runtime.enable_pmp) {
+                if (!this.registers.checkPmpAccess(address, access, this.getPrivilege())) {
+                    return MemoryError.PmpViolation;
+                }
+            }
+
             const byte_len = @sizeOf(T);
+
+            if (comptime config.runtime.enable_memory_alignment) {
+                if (address % byte_len != 0) {
+                    return MemoryError.MisalignedAddress;
+                }
+            }
 
             if (comptime config.hooks.isMmio != null and config.hooks.read != null) {
                 if (config.hooks.isMmio.?(this, address)) {
@@ -323,20 +335,8 @@ pub inline fn Cpu(comptime config: Config) type {
             else
                 address;
 
-            if (comptime config.runtime.enable_pmp) {
-                if (!this.registers.checkPmpAccess(translated, access, this.getPrivilege())) {
-                    return MemoryError.PmpViolation;
-                }
-            }
-
             if (translated + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
-            }
-
-            if (comptime config.runtime.enable_memory_alignment) {
-                if (translated % byte_len != 0) {
-                    return MemoryError.MisalignedAddress;
-                }
             }
 
             const result: T = std.mem.bytesToValue(T, this.ram[translated .. translated + byte_len]);
@@ -347,8 +347,20 @@ pub inline fn Cpu(comptime config: Config) type {
         pub inline fn writeMemory(this: *Self, address: u32, value: anytype) MemoryError!void {
             @setEvalBranchQuota(std.math.maxInt(u32));
 
+            if (comptime config.runtime.enable_pmp) {
+                if (!this.registers.checkPmpAccess(address, .write, this.getPrivilege())) {
+                    return MemoryError.PmpViolation;
+                }
+            }
+
             const T = @TypeOf(value);
             const byte_len = @sizeOf(T);
+
+            if (comptime config.runtime.enable_memory_alignment) {
+                if (address % byte_len != 0) {
+                    return MemoryError.MisalignedAddress;
+                }
+            }
 
             if (comptime config.hooks.isMmio != null and config.hooks.write != null) {
                 if (config.hooks.isMmio.?(this, address)) {
@@ -367,20 +379,8 @@ pub inline fn Cpu(comptime config: Config) type {
             else
                 address;
 
-            if (comptime config.runtime.enable_pmp) {
-                if (!this.registers.checkPmpAccess(translated, .write, this.getPrivilege())) {
-                    return MemoryError.PmpViolation;
-                }
-            }
-
             if (translated + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
-            }
-
-            if (comptime config.runtime.enable_memory_alignment) {
-                if (translated % byte_len != 0) {
-                    return MemoryError.MisalignedAddress;
-                }
             }
 
             const bytes = std.mem.asBytes(&std.mem.nativeTo(T, value, arch.ENDIAN));
