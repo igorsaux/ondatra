@@ -3613,8 +3613,7 @@ pub inline fn Cpu(comptime config: Config) type {
                         }
                     }
 
-                    this.incCounters(true);
-                    this.registers.pc +%= 4;
+                    this.incCounters(false);
 
                     return .halt;
                 },
@@ -8678,4 +8677,72 @@ fn configurePmpForCode(cpu: *TestCpu) void {
     // Entry 15 is in pmpcfg[3], byte 3
     cpu.registers.pmpcfg[3] = (cpu.registers.pmpcfg[3] & 0x00FFFFFF) |
         (@as(u32, @as(u8, @bitCast(cfg))) << 24);
+}
+
+test "wfi halts without advancing PC when no interrupt pending" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.mie = .{}; // No interrupts enabled
+    cpu.registers.mip = .{}; // No interrupts pending
+
+    const state1 = cpu.step();
+    try std.testing.expectEqual(TestCpu.State.halt, state1);
+    try std.testing.expectEqual(@as(u32, 0), cpu.registers.pc); // PC NOT advanced!
+
+    // Call step() again without setting interrupt - should still halt at WFI
+    const state2 = cpu.step();
+    try std.testing.expectEqual(TestCpu.State.halt, state2);
+    try std.testing.expectEqual(@as(u32, 0), cpu.registers.pc); // Still at WFI!
+}
+
+test "wfi resumes when interrupt becomes pending" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.mie.mtie = true;
+    cpu.registers.mip = .{}; // No interrupts yet
+
+    // First step - halt at WFI
+    const state1 = cpu.step();
+    try std.testing.expectEqual(TestCpu.State.halt, state1);
+    try std.testing.expectEqual(@as(u32, 0), cpu.registers.pc);
+
+    // Now set interrupt
+    cpu.registers.mtime = 100;
+    cpu.registers.mtimecmp = 50; // Will set mtip
+
+    // Next step - WFI sees pending, advances PC
+    const state2 = cpu.step();
+    try std.testing.expectEqual(TestCpu.State.ok, state2);
+    try std.testing.expectEqual(@as(u32, 4), cpu.registers.pc); // Advanced past WFI
+}
+
+test "wfi with global interrupts enabled triggers handler" {
+    var ram = initRamWithCode(1024, &.{
+        .wfi,
+        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.mstatus.mie = true; // Global interrupts enabled
+    cpu.registers.mie.mtie = true;
+    cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
+
+    // First step - halt
+    _ = cpu.step();
+    try std.testing.expectEqual(@as(u32, 0), cpu.registers.pc);
+
+    // Set interrupt
+    cpu.registers.mtime = 100;
+    cpu.registers.mtimecmp = 50;
+
+    // Next step - interrupt handler called (checkInterrupts at start of step)
+    const state2 = cpu.step();
+    try std.testing.expectEqual(TestCpu.State.ok, state2);
+    try std.testing.expectEqual(@as(u32, 0x100), cpu.registers.pc); // At handler
+    try std.testing.expectEqual(@as(u32, 0), cpu.registers.mepc); // Return to WFI
 }
