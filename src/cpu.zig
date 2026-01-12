@@ -255,14 +255,14 @@ pub inline fn Cpu(comptime config: Config) type {
             return .{ .trap = .{ .cause = .{ .exception = exception }, .tval = tval } };
         }
 
-        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8, offset: i32) ElfLoadError!void {
+        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8, offset: u32) ElfLoadError!void {
             var reader: std.Io.Reader = .fixed(content);
 
             var file = try elf.File.parse(allocator, &reader);
             defer file.deinit(allocator);
 
             const ventry = file.header.entry;
-            file.header.entry = @as(u32, @intCast(@as(i32, @intCast(file.header.entry)) +% offset));
+            file.header.entry = file.header.entry -% offset;
 
             if (file.header.entry > this.ram.len) {
                 return ElfLoadError.OutOfRam;
@@ -273,7 +273,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     continue;
                 }
 
-                header.vaddr = @as(u32, @intCast(@as(i32, @intCast(header.vaddr)) +% offset));
+                header.vaddr = header.vaddr -% offset;
 
                 if (header.vaddr >= this.ram.len) {
                     return ElfLoadError.OutOfRam;
