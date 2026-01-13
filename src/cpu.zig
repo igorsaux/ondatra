@@ -208,7 +208,7 @@ pub inline fn Cpu(comptime config: Config) type {
             return .ok;
         }
 
-        inline fn getPrivilege(this: *Self) arch.PrivilegeLevel {
+        pub inline fn getPrivilege(this: *Self) arch.PrivilegeLevel {
             if (comptime config.runtime.enable_privilege) {
                 return this.registers.privilege.sanitize();
             } else {
@@ -216,7 +216,7 @@ pub inline fn Cpu(comptime config: Config) type {
             }
         }
 
-        inline fn checkFpuAccess(this: *Self) ?State {
+        pub inline fn checkFpuAccess(this: *Self) ?State {
             if (comptime !config.runtime.enable_fpu) {
                 return trapState(.illegal_instruction, 0);
             }
@@ -244,7 +244,7 @@ pub inline fn Cpu(comptime config: Config) type {
             return null;
         }
 
-        inline fn markFpuDirty(this: *Self) void {
+        pub inline fn markFpuDirty(this: *Self) void {
             if (this.registers.mstatus.fs != 0) {
                 this.registers.mstatus.fs = 0b11; // Dirty
                 this.registers.mstatus.updateSD();
