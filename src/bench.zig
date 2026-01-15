@@ -214,14 +214,14 @@ const Runner = struct {
 
         const stats = this.recordings.?.stats(allocator);
 
-        std.debug.print("\n+{s:-^97}+\n", .{benchmark.name});
-        std.debug.print("|{s: ^10}|{s: ^12}|{s: ^12}|{s: ^12}|{s: ^12}|{s: ^12}|{s: ^10}|{s: ^10}|\n", .{
-            "instr", "min", "max", "avg", "median", "std_dev", "MIPS avg", "MIPS max",
+        std.debug.print("\n+{s:-^108}+\n", .{benchmark.name});
+        std.debug.print("|{s: ^10}|{s: ^12}|{s: ^12}|{s: ^12}|{s: ^12}|{s: ^12}|{s: ^10}|{s: ^10}|{s: ^10}|\n", .{
+            "instr", "min", "max", "avg", "median", "std_dev", "MIPS avg", "MIPS min", "MIPS max",
         });
-        std.debug.print("|{s:-^10}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^10}|{s:-^10}|\n", .{
-            "", "", "", "", "", "", "", "",
+        std.debug.print("|{s:-^10}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^10}|{s:-^10}|{s:-^10}|\n", .{
+            "", "", "", "", "", "", "", "", "",
         });
-        std.debug.print("|{d: ^10}|{D: ^12}|{D: ^12}|{D: ^12}|{D: ^12}|{d: ^12.2}|{d: ^10.1}|{d: ^10.1}|\n", .{
+        std.debug.print("|{d: ^10}|{D: ^12}|{D: ^12}|{D: ^12}|{D: ^12}|{d: ^12.2}|{d: ^10.1}|{d: ^10.1}|{d: ^10.1}|\n", .{
             stats.instructions,
             @as(i64, @truncate(stats.min)),
             @as(i64, @truncate(stats.max)),
@@ -229,9 +229,10 @@ const Runner = struct {
             @as(i64, @truncate(stats.median)),
             stats.std_dev / 1000.0,
             stats.mips(),
+            stats.mipsFromTime(stats.max),
             stats.mipsFromTime(stats.min),
         });
-        std.debug.print("+{s:-^97}+\n\n", .{"-"});
+        std.debug.print("+{s:-^108}+\n\n", .{"-"});
     }
 };
 
