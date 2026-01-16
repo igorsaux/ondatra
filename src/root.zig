@@ -4,9 +4,11 @@
 pub const arch = @import("arch.zig");
 pub const cpu = @import("cpu.zig");
 pub const elf = @import("elf.zig");
+pub const guest = @import("guest.zig");
 
 comptime {
     _ = elf;
     _ = arch;
     _ = cpu;
+    _ = guest;
 }
