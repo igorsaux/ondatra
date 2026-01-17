@@ -68,12 +68,30 @@ pub const Mstatus = struct {
         dirty = 0b11,
     };
 
+    // Bit masks
+    pub const SIE: u32 = 1 << 1;
     pub const MIE: u32 = 1 << 3;
+    pub const SPIE: u32 = 1 << 5;
+    pub const UBE: u32 = 1 << 6;
     pub const MPIE: u32 = 1 << 7;
+    pub const SPP: u32 = 1 << 8;
+    pub const VS: u32 = 0b11 << 9;
     pub const MPP: u32 = 0b11 << 11;
-    pub const MPP_SHIFT: u5 = 11;
+    pub const FS: u32 = 0b11 << 13;
+    pub const XS: u32 = 0b11 << 15;
     pub const MPRV: u32 = 1 << 17;
+    pub const SUM: u32 = 1 << 18;
+    pub const MXR: u32 = 1 << 19;
+    pub const TVM: u32 = 1 << 20;
     pub const TW: u32 = 1 << 21;
+    pub const TSR: u32 = 1 << 22;
+    pub const SD: u32 = 1 << 31;
+
+    // Bit shifts
+    pub const VS_SHIFT: u5 = 9;
+    pub const MPP_SHIFT: u5 = 11;
+    pub const FS_SHIFT: u5 = 13;
+    pub const XS_SHIFT: u5 = 15;
 
     pub inline fn read() arch.Registers.Mstatus {
         return @bitCast(Csr.read(.mstatus));
@@ -91,7 +109,40 @@ pub const Mstatus = struct {
         Csr.write(.mstatus, value);
     }
 
-    // MIE - Machine Interrupt Enable
+    pub inline fn getFs() FsState {
+        return @enumFromInt(read().fs);
+    }
+
+    pub inline fn setFs(state: FsState) void {
+        var val = read();
+        val.fs = @intFromEnum(state);
+        write(val);
+    }
+
+    pub inline fn enableFpu() void {
+        setFs(.initial);
+    }
+
+    pub inline fn disableFpu() void {
+        setFs(.off);
+    }
+
+    pub inline fn isFpuEnabled() bool {
+        return getFs() != .off;
+    }
+
+    pub inline fn isFpuDirty() bool {
+        return getFs() == .dirty;
+    }
+
+    pub inline fn markFpuDirty() void {
+        setFs(.dirty);
+    }
+
+    pub inline fn markFpuClean() void {
+        setFs(.clean);
+    }
+
     pub inline fn getMie() bool {
         return read().mie;
     }
@@ -153,6 +204,28 @@ pub const Mstatus = struct {
 
     pub inline fn clearTw() void {
         Csr.clear(.mstatus, TW);
+    }
+
+    pub inline fn getSd() bool {
+        return read().sd;
+    }
+
+    pub inline fn initWithFpu() void {
+        write(.{
+            .mie = false,
+            .mpie = false,
+            .mpp = @intFromEnum(arch.PrivilegeLevel.machine),
+            .fs = @intFromEnum(FsState.initial),
+        });
+    }
+
+    pub inline fn prepareUserModeWithFpu() void {
+        var val = read();
+        val.mpp = @intFromEnum(arch.PrivilegeLevel.user);
+        val.mpie = true;
+        val.fs = @intFromEnum(FsState.initial);
+
+        write(val);
     }
 };
 
@@ -909,3 +982,216 @@ pub inline fn criticalSection(comptime func: fn () void) void {
 
     func();
 }
+
+pub const Fcsr = struct {
+    pub const Value = packed struct(u32) {
+        /// Accrued exception flags
+        fflags: arch.Registers.Fcsr = .{},
+        frm: arch.Registers.Fcsr.RoundingMode = .rne,
+        _reserved: u24 = 0,
+    };
+
+    // Bit positions and masks
+    pub const FFLAGS_MASK: u32 = 0x1F;
+    pub const FRM_MASK: u32 = 0x07 << 5;
+    pub const FRM_SHIFT: u5 = 5;
+
+    pub inline fn read() Value {
+        return @bitCast(Csr.read(.fcsr));
+    }
+
+    pub inline fn write(value: Value) void {
+        Csr.write(.fcsr, @bitCast(value));
+    }
+
+    pub inline fn raw() u32 {
+        return Csr.read(.fcsr);
+    }
+
+    pub inline fn writeRaw(value: u32) void {
+        Csr.write(.fcsr, value);
+    }
+
+    pub inline fn getRoundingMode() arch.Registers.Fcsr.RoundingMode {
+        return read().frm;
+    }
+
+    pub inline fn setRoundingMode(mode: arch.Registers.Fcsr.RoundingMode) void {
+        var val = read();
+        val.frm = mode;
+
+        write(val);
+    }
+
+    /// Set rounding mode and return previous
+    pub inline fn swapRoundingMode(mode: arch.Registers.Fcsr.RoundingMode) arch.Registers.Fcsr.RoundingMode {
+        const prev = read();
+
+        var val = prev;
+        val.frm = mode;
+
+        write(val);
+
+        return prev.frm;
+    }
+
+    pub inline fn getFlags() arch.Registers.Fcsr {
+        return read().fflags;
+    }
+
+    pub inline fn setFlags(flags: arch.Registers.Fcsr) void {
+        var val = read();
+
+        val.fflags = flags;
+        write(val);
+    }
+
+    pub inline fn clearFlags() void {
+        Csr.clear(.fcsr, FFLAGS_MASK);
+    }
+
+    /// Read flags and clear them atomically
+    pub inline fn readAndClearFlags() arch.Registers.Fcsr {
+        const prev = Csr.readClear(.fcsr, FFLAGS_MASK);
+
+        return @bitCast(@as(u5, @truncate(prev)));
+    }
+
+    pub inline fn isInexact() bool {
+        return getFlags().nx;
+    }
+
+    pub inline fn isUnderflow() bool {
+        return getFlags().uf;
+    }
+
+    pub inline fn isOverflow() bool {
+        return getFlags().of;
+    }
+
+    pub inline fn isDivideByZero() bool {
+        return getFlags().dz;
+    }
+
+    pub inline fn isInvalidOperation() bool {
+        return getFlags().nv;
+    }
+
+    pub inline fn hasAnyException() bool {
+        return getFlags().any();
+    }
+
+    /// Execute code with specific rounding mode, restore after
+    pub inline fn withRoundingMode(mode: arch.Registers.Fcsr.RoundingMode, comptime func: fn () callconv(.@"inline") void) void {
+        const prev = swapRoundingMode(mode);
+        defer setRoundingMode(prev);
+
+        func();
+    }
+
+    /// Execute code and return any raised exceptions
+    pub inline fn catchExceptions(comptime func: fn () callconv(.@"inline") void) arch.Registers.Fcsr {
+        clearFlags();
+        func();
+
+        return getFlags();
+    }
+
+    /// Initialize FCSR to default state
+    pub inline fn init() void {
+        write(.{
+            .fflags = .{},
+            .frm = .rne,
+        });
+    }
+};
+
+pub const Fflags = struct {
+    pub inline fn read() arch.Registers.Fcsr {
+        return @bitCast(@as(u5, @truncate(Csr.read(.fflags))));
+    }
+
+    pub inline fn write(flags: arch.Registers.Fcsr) void {
+        Csr.write(.fflags, @as(u5, @bitCast(flags)));
+    }
+
+    pub inline fn raw() u5 {
+        return @truncate(Csr.read(.fflags));
+    }
+
+    pub inline fn writeRaw(value: u5) void {
+        Csr.write(.fflags, value);
+    }
+
+    pub inline fn clear() void {
+        Csr.write(.fflags, 0);
+    }
+
+    /// Read and clear atomically
+    pub inline fn readAndClear() arch.Registers.Fcsr {
+        const prev = Csr.readClear(.fflags, arch.Registers.Fcsr.ALL);
+        return @bitCast(@as(u5, @truncate(prev)));
+    }
+
+    /// Set specific flag
+    pub inline fn raise(comptime flag: enum { nx, uf, of, dz, nv }) void {
+        const mask: u32 = switch (flag) {
+            .nx => arch.Registers.Fcsr.NX,
+            .uf => arch.Registers.Fcsr.UF,
+            .of => arch.Registers.Fcsr.OF,
+            .dz => arch.Registers.Fcsr.DZ,
+            .nv => arch.Registers.Fcsr.NV,
+        };
+
+        Csr.set(.fflags, mask);
+    }
+
+    /// Check specific flag
+    pub inline fn isSet(comptime flag: enum { nx, uf, of, dz, nv }) bool {
+        return @field(read(), @tagName(flag));
+    }
+};
+
+pub const Frm = struct {
+    pub inline fn read() arch.Registers.Fcsr.RoundingMode {
+        return @enumFromInt(@as(u3, @truncate(Csr.read(.frm))));
+    }
+
+    pub inline fn write(mode: arch.Registers.Fcsr.RoundingMode) void {
+        Csr.write(.frm, @intFromEnum(mode));
+    }
+
+    pub inline fn raw() u3 {
+        return @truncate(Csr.read(.frm));
+    }
+
+    pub inline fn writeRaw(value: u3) void {
+        Csr.write(.frm, value);
+    }
+
+    /// Common rounding mode setters
+    pub inline fn setRoundToNearest() void {
+        write(.rne);
+    }
+
+    pub inline fn setRoundToZero() void {
+        write(.rtz);
+    }
+
+    pub inline fn setRoundDown() void {
+        write(.rdn);
+    }
+
+    pub inline fn setRoundUp() void {
+        write(.rup);
+    }
+
+    /// Check current mode
+    pub inline fn isRoundToNearest() bool {
+        return read() == .rne;
+    }
+
+    pub inline fn isRoundToZero() bool {
+        return read() == .rtz;
+    }
+};

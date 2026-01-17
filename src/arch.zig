@@ -457,6 +457,13 @@ pub const Registers = struct {
             dyn = 0b111, // Dynamic (use frm from fcsr)
         };
 
+        pub const NX: u5 = 1 << 0;
+        pub const UF: u5 = 1 << 1;
+        pub const OF: u5 = 1 << 2;
+        pub const DZ: u5 = 1 << 3;
+        pub const NV: u5 = 1 << 4;
+        pub const ALL: u5 = 0x1F;
+
         // Exception flags (fflags) - bits 4:0
         nx: bool = false, // Inexact
         uf: bool = false, // Underflow
