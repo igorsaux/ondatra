@@ -975,14 +975,6 @@ pub inline fn restoreInterrupts(prev: bool) void {
     }
 }
 
-// Critical section helper
-pub inline fn criticalSection(comptime func: fn () void) void {
-    const prev = disableInterrupts();
-    defer restoreInterrupts(prev);
-
-    func();
-}
-
 pub const Fcsr = struct {
     pub const Value = packed struct(u32) {
         /// Accrued exception flags
@@ -1079,22 +1071,6 @@ pub const Fcsr = struct {
 
     pub inline fn hasAnyException() bool {
         return getFlags().any();
-    }
-
-    /// Execute code with specific rounding mode, restore after
-    pub inline fn withRoundingMode(mode: arch.Registers.Fcsr.RoundingMode, comptime func: fn () callconv(.@"inline") void) void {
-        const prev = swapRoundingMode(mode);
-        defer setRoundingMode(prev);
-
-        func();
-    }
-
-    /// Execute code and return any raised exceptions
-    pub inline fn catchExceptions(comptime func: fn () callconv(.@"inline") void) arch.Registers.Fcsr {
-        clearFlags();
-        func();
-
-        return getFlags();
     }
 
     /// Initialize FCSR to default state
