@@ -8,7 +8,7 @@ pub const Csr = struct {
         return asm volatile ("csrr %[ret], %[csr]"
             : [ret] "=r" (-> u32),
             : [csr] "i" (@intFromEnum(csr)),
-        );
+            : .{ .memory = true });
     }
 
     pub inline fn write(comptime csr: arch.Registers.Csr, value: u32) void {
@@ -16,7 +16,7 @@ pub const Csr = struct {
             :
             : [csr] "i" (@intFromEnum(csr)),
               [val] "r" (value),
-        );
+            : .{ .memory = true });
     }
 
     pub inline fn set(comptime csr: arch.Registers.Csr, mask: u32) void {
@@ -24,7 +24,7 @@ pub const Csr = struct {
             :
             : [csr] "i" (@intFromEnum(csr)),
               [mask] "r" (mask),
-        );
+            : .{ .memory = true });
     }
 
     pub inline fn clear(comptime csr: arch.Registers.Csr, mask: u32) void {
@@ -32,7 +32,7 @@ pub const Csr = struct {
             :
             : [csr] "i" (@intFromEnum(csr)),
               [mask] "r" (mask),
-        );
+            : .{ .memory = true });
     }
 
     pub inline fn readWrite(comptime csr: arch.Registers.Csr, value: u32) u32 {
@@ -40,7 +40,7 @@ pub const Csr = struct {
             : [ret] "=r" (-> u32),
             : [csr] "i" (@intFromEnum(csr)),
               [val] "r" (value),
-        );
+            : .{ .memory = true });
     }
 
     pub inline fn readSet(comptime csr: arch.Registers.Csr, mask: u32) u32 {
@@ -48,7 +48,7 @@ pub const Csr = struct {
             : [ret] "=r" (-> u32),
             : [csr] "i" (@intFromEnum(csr)),
               [mask] "r" (mask),
-        );
+            : .{ .memory = true });
     }
 
     pub inline fn readClear(comptime csr: arch.Registers.Csr, mask: u32) u32 {
@@ -56,7 +56,7 @@ pub const Csr = struct {
             : [ret] "=r" (-> u32),
             : [csr] "i" (@intFromEnum(csr)),
               [mask] "r" (mask),
-        );
+            : .{ .memory = true });
     }
 };
 
@@ -936,28 +936,28 @@ pub const Instret = struct {
 };
 
 pub inline fn wfi() void {
-    asm volatile ("wfi");
+    asm volatile ("wfi" ::: .{ .memory = true });
 }
 
 pub inline fn mret() noreturn {
-    asm volatile ("mret");
+    asm volatile ("mret" ::: .{ .memory = true });
     unreachable;
 }
 
 pub inline fn ecall() void {
-    asm volatile ("ecall");
+    asm volatile ("ecall" ::: .{ .memory = true });
 }
 
 pub inline fn ebreak() void {
-    asm volatile ("ebreak");
+    asm volatile ("ebreak" ::: .{ .memory = true });
 }
 
 pub inline fn fence() void {
-    asm volatile ("fence");
+    asm volatile ("fence" ::: .{ .memory = true });
 }
 
 pub inline fn fenceI() void {
-    asm volatile ("fence.i");
+    asm volatile ("fence.i" ::: .{ .memory = true });
 }
 
 // Disable interrupts and return previous state
