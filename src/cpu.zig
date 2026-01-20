@@ -41,6 +41,10 @@ pub const Config = struct {
         /// Disable for ~2-3x speedup when running trusted code.
         enable_pmp: bool = true,
 
+        /// If disabled - enables Physical Memory Protection checks in M mode only when
+        /// MPRV is set.
+        enable_pmp_m: bool = true,
+
         /// Enable memory alignment checks for loads/stores.
         /// RISC-V spec requires this, disable only for known-aligned code.
         enable_memory_alignment: bool = true,
@@ -306,7 +310,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
             const byte_len = @sizeOf(T);
 
-            if (comptime config.runtime.enable_pmp) {
+            if (this.needsPmpCheck(access)) {
                 if (!this.registers.checkPmpAccess(address, byte_len, access, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
                 }
@@ -354,7 +358,7 @@ pub inline fn Cpu(comptime config: Config) type {
             const T = @TypeOf(value);
             const byte_len = @sizeOf(T);
 
-            if (comptime config.runtime.enable_pmp) {
+            if (this.needsPmpCheck(.write)) {
                 if (!this.registers.checkPmpAccess(address, byte_len, .write, this.getPrivilege())) {
                     return MemoryError.PmpViolation;
                 }
@@ -391,6 +395,26 @@ pub inline fn Cpu(comptime config: Config) type {
 
             const bytes = std.mem.asBytes(&std.mem.nativeTo(T, value, arch.ENDIAN));
             @memcpy(this.ram[translated .. translated + byte_len], bytes);
+        }
+
+        inline fn needsPmpCheck(this: *Self, comptime access: arch.Registers.Pmp.AccessType) bool {
+            if (comptime !config.runtime.enable_pmp) {
+                return false;
+            }
+
+            if (comptime config.runtime.enable_pmp_m) {
+                return true;
+            }
+
+            if (this.getPrivilege() != .machine) {
+                return true;
+            }
+
+            if (comptime access == .execute) {
+                return false;
+            }
+
+            return this.registers.mstatus.mprv;
         }
 
         inline fn fetch(this: *Self) FetchError!arch.Instruction {

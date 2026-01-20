@@ -275,6 +275,7 @@ pub fn main() !void {
 /// Like `.fast` but with enabled counters of course!
 const FAST: ondatra.cpu.Config.Runtime = .{
     .enable_pmp = false,
+    .enable_pmp_m = false,
     .enable_memory_alignment = false,
     .enable_privilege = false,
     .enable_csr_checks = false,
