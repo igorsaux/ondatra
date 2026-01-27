@@ -417,7 +417,7 @@ pub inline fn Cpu(comptime config: Config) type {
             return this.registers.mstatus.mprv;
         }
 
-        inline fn fetch(this: *Self) FetchError!arch.Instruction {
+        pub inline fn fetch(this: *Self) FetchError!arch.Instruction {
             @setEvalBranchQuota(std.math.maxInt(u32));
 
             const raw = try this.readMemory(this.registers.pc, u32, .execute);
