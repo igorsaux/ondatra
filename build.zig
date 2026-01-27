@@ -38,6 +38,31 @@ pub fn build(b: *std.Build) void {
         bench_cmd.addArgs(args);
     }
 
+    const coremark = b.addExecutable(.{
+        .name = "coremark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("coremark/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ondatra", .module = mod },
+            },
+        }),
+    });
+
+    addCoremarkGuest(b, coremark);
+
+    b.installArtifact(coremark);
+
+    const coremark_step = b.step("coremark", "Run the coremark benchmark");
+
+    const coremark_cmd = b.addRunArtifact(coremark);
+    coremark_step.dependOn(&coremark_cmd.step);
+
+    if (b.args) |args| {
+        coremark_cmd.addArgs(args);
+    }
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
@@ -76,7 +101,7 @@ fn addBinary(b: *std.Build, step: *std.Build.Step.Compile, path: std.Build.LazyP
         .root_module = b.createModule(.{
             .root_source_file = path,
             .target = target,
-            .optimize = .ReleaseSmall,
+            .optimize = .ReleaseFast,
         }),
     });
     binary.linker_script = b.path("src/bench/env/ondatra.ld");
@@ -84,6 +109,35 @@ fn addBinary(b: *std.Build, step: *std.Build.Step.Compile, path: std.Build.LazyP
     b.installArtifact(binary);
 
     step.root_module.addAnonymousImport(name, .{
+        .root_source_file = binary.getEmittedBin(),
+    });
+}
+
+fn addCoremarkGuest(b: *std.Build, step: *std.Build.Step.Compile) void {
+    const target = b.resolveTargetQuery(riscv32Query);
+
+    const binary = b.addExecutable(.{
+        .name = "coremark_guest",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    binary.root_module.addIncludePath(b.path("coremark/"));
+    binary.root_module.addCSourceFiles(.{
+        .files = &.{
+            "coremark/core_list_join.c",
+            "coremark/core_main.c",
+            "coremark/core_matrix.c",
+            "coremark/core_portme.c",
+            "coremark/core_state.c",
+            "coremark/core_util.c",
+        },
+        .language = .c,
+    });
+    binary.linker_script = b.path("coremark/link.ld");
+
+    step.root_module.addAnonymousImport("coremark_guest.bin", .{
         .root_source_file = binary.getEmittedBin(),
     });
 }
