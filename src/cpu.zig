@@ -260,45 +260,45 @@ pub inline fn Cpu(comptime config: Config) type {
         }
 
         pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8, offset: u32) ElfLoadError!void {
-            var reader: std.Io.Reader = .fixed(content);
-
-            var file = try elf.File.parse(allocator, &reader);
+            var file = try elf.File.parseFromSlice(allocator, content);
             defer file.deinit(allocator);
 
             const ventry = file.header.entry;
-            file.header.entry = file.header.entry -% offset;
-
-            if (file.header.entry > this.ram.len) {
-                return ElfLoadError.OutOfRam;
-            }
 
             for (file.program_headers.items) |*header| {
                 if (header.ty != .load) {
                     continue;
                 }
 
-                header.vaddr = header.vaddr -% offset;
+                if (header.vaddr == 0 and header.filesz == 0 and header.memsz > this.ram.len) {
+                    continue;
+                }
 
-                if (header.vaddr >= this.ram.len) {
+                const vaddr = header.vaddr -% offset;
+
+                if (vaddr >= this.ram.len) {
                     return ElfLoadError.OutOfRam;
                 }
 
-                if (header.vaddr +% header.filesz > this.ram.len or header.vaddr +% header.memsz > this.ram.len) {
+                if (vaddr +% header.filesz > this.ram.len or vaddr +% header.memsz > this.ram.len) {
                     return ElfLoadError.OutOfRam;
                 }
 
                 if (header.filesz > 0) {
-                    const from: u32 = header.vaddr;
-                    const to: u32 = from +% header.filesz;
+                    const file_end = header.offset + header.filesz;
 
-                    @memcpy(this.ram[from..to], content[header.offset .. header.offset + header.filesz]);
+                    if (file_end > content.len) {
+                        return ElfLoadError.OutOfRam;
+                    }
+
+                    @memcpy(this.ram[vaddr..][0..header.filesz], content[header.offset..][0..header.filesz]);
                 }
 
                 if (header.memsz > header.filesz) {
-                    const from: u32 = header.vaddr +% header.filesz;
-                    const to: u32 = (from +% header.memsz) - header.filesz;
+                    const bss_start = vaddr + header.filesz;
+                    const bss_size = header.memsz - header.filesz;
 
-                    @memset(this.ram[from..to], 0);
+                    @memset(this.ram[bss_start..][0..bss_size], 0);
                 }
             }
 

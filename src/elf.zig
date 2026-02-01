@@ -375,8 +375,11 @@ pub const File = struct {
     header: Header,
     program_headers: std.ArrayList(ProgramHeader),
 
-    pub fn parse(allocator: std.mem.Allocator, reader: *std.Io.Reader) ParseError!File {
-        const header: Header = try Header.parse(reader);
+    pub fn parseFromSlice(allocator: std.mem.Allocator, content: []const u8) ParseError!File {
+        var reader: std.Io.Reader = .fixed(content);
+
+        const header: Header = try Header.parse(&reader);
+
         var program_headers: std.ArrayList(ProgramHeader) = .empty;
 
         try program_headers.ensureTotalCapacityPrecise(allocator, header.phnum);
@@ -384,8 +387,14 @@ pub const File = struct {
 
         errdefer program_headers.deinit(allocator);
 
+        if (header.phoff >= content.len) {
+            return ParseError.ReadFailed;
+        }
+
+        var ph_reader: std.Io.Reader = .fixed(content[header.phoff..]);
+
         for (0..header.phnum) |i| {
-            program_headers.items[i] = try ProgramHeader.parse(reader);
+            program_headers.items[i] = try ProgramHeader.parse(&ph_reader);
         }
 
         return .{
