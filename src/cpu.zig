@@ -343,7 +343,7 @@ pub inline fn Cpu(comptime config: Config) type {
             else
                 address;
 
-            if (translated + byte_len > this.ram.len) {
+            if (@as(u64, translated) + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
             }
 
@@ -389,7 +389,7 @@ pub inline fn Cpu(comptime config: Config) type {
             else
                 address;
 
-            if (translated + byte_len > this.ram.len) {
+            if (@as(u64, translated) + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
             }
 

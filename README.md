@@ -86,5 +86,5 @@
 
 ### CoreMark
 
-- Конфигурация `compilant`: 540
-- Конфигурация `compilant` без PMP: 760
+- Конфигурация `compilant`: 552
+- Конфигурация `compilant` без PMP: 753

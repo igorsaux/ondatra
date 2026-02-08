@@ -1060,30 +1060,30 @@ pub const Instruction = union(enum) {
     pub const DecodeError = error{ UnknownInstruction, BadRegister };
 
     // RV32I
-    lui: struct { rd: u8, imm: i20 },
-    auipc: struct { rd: u8, imm: i20 },
-    jal: struct { rd: u8, imm: i20 },
-    jalr: struct { rd: u8, rs1: u8, imm: i12 },
-    beq: struct { rs1: u8, rs2: u8, imm: i12 },
-    bne: struct { rs1: u8, rs2: u8, imm: i12 },
-    blt: struct { rs1: u8, rs2: u8, imm: i12 },
-    bge: struct { rs1: u8, rs2: u8, imm: i12 },
-    bltu: struct { rs1: u8, rs2: u8, imm: i12 },
-    bgeu: struct { rs1: u8, rs2: u8, imm: i12 },
-    lb: struct { rd: u8, rs1: u8, imm: i12 },
-    lh: struct { rd: u8, rs1: u8, imm: i12 },
-    lw: struct { rd: u8, rs1: u8, imm: i12 },
-    lbu: struct { rd: u8, rs1: u8, imm: i12 },
-    lhu: struct { rd: u8, rs1: u8, imm: i12 },
-    sb: struct { rs1: u8, rs2: u8, imm: i12 },
-    sh: struct { rs1: u8, rs2: u8, imm: i12 },
-    sw: struct { rs1: u8, rs2: u8, imm: i12 },
-    addi: struct { rd: u8, rs1: u8, imm: i12 },
-    slti: struct { rd: u8, rs1: u8, imm: i12 },
-    sltiu: struct { rd: u8, rs1: u8, imm: i12 },
-    xori: struct { rd: u8, rs1: u8, imm: i12 },
-    ori: struct { rd: u8, rs1: u8, imm: i12 },
-    andi: struct { rd: u8, rs1: u8, imm: i12 },
+    lui: struct { rd: u8, imm: i32 },
+    auipc: struct { rd: u8, imm: i32 },
+    jal: struct { rd: u8, imm: i32 },
+    jalr: struct { rd: u8, rs1: u8, imm: i32 },
+    beq: struct { rs1: u8, rs2: u8, imm: i32 },
+    bne: struct { rs1: u8, rs2: u8, imm: i32 },
+    blt: struct { rs1: u8, rs2: u8, imm: i32 },
+    bge: struct { rs1: u8, rs2: u8, imm: i32 },
+    bltu: struct { rs1: u8, rs2: u8, imm: i32 },
+    bgeu: struct { rs1: u8, rs2: u8, imm: i32 },
+    lb: struct { rd: u8, rs1: u8, imm: i32 },
+    lh: struct { rd: u8, rs1: u8, imm: i32 },
+    lw: struct { rd: u8, rs1: u8, imm: i32 },
+    lbu: struct { rd: u8, rs1: u8, imm: i32 },
+    lhu: struct { rd: u8, rs1: u8, imm: i32 },
+    sb: struct { rs1: u8, rs2: u8, imm: i32 },
+    sh: struct { rs1: u8, rs2: u8, imm: i32 },
+    sw: struct { rs1: u8, rs2: u8, imm: i32 },
+    addi: struct { rd: u8, rs1: u8, imm: i32 },
+    slti: struct { rd: u8, rs1: u8, imm: i32 },
+    sltiu: struct { rd: u8, rs1: u8, imm: i32 },
+    xori: struct { rd: u8, rs1: u8, imm: i32 },
+    ori: struct { rd: u8, rs1: u8, imm: i32 },
+    andi: struct { rd: u8, rs1: u8, imm: i32 },
     slli: struct { rd: u8, rs1: u8, shamt: u5 },
     srli: struct { rd: u8, rs1: u8, shamt: u5 },
     srai: struct { rd: u8, rs1: u8, shamt: u5 },
@@ -1110,8 +1110,8 @@ pub const Instruction = union(enum) {
     rem: struct { rd: u8, rs1: u8, rs2: u8 },
     remu: struct { rd: u8, rs1: u8, rs2: u8 },
     // RV32F
-    flw: struct { rd: u8, rs1: u8, imm: i12 },
-    fsw: struct { rs1: u8, rs2: u8, imm: i12 },
+    flw: struct { rd: u8, rs1: u8, imm: i32 },
+    fsw: struct { rs1: u8, rs2: u8, imm: i32 },
     fmadd_s: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
     fmsub_s: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
     fnmsub_s: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
@@ -1137,8 +1137,8 @@ pub const Instruction = union(enum) {
     fcvt_s_wu: struct { rd: u8, rs1: u8, rm: u3 },
     fmv_w_x: struct { rd: u8, rs1: u8 },
     // RV32D
-    fld: struct { rd: u8, rs1: u8, imm: i12 },
-    fsd: struct { rs1: u8, rs2: u8, imm: i12 },
+    fld: struct { rd: u8, rs1: u8, imm: i32 },
+    fsd: struct { rs1: u8, rs2: u8, imm: i32 },
     fmadd_d: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
     fmsub_d: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
     fnmsub_d: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
@@ -1339,26 +1339,26 @@ pub const Instruction = union(enum) {
             0b0110111 => return .{
                 .lui = .{
                     .rd = try toRegisterChecked(decodeRd(from)),
-                    .imm = @truncate(decodeImmediate(from, .u)),
+                    .imm = decodeImmediate(from, .u),
                 },
             },
             0b0010111 => return .{
                 .auipc = .{
                     .rd = try toRegisterChecked(decodeRd(from)),
-                    .imm = @truncate(decodeImmediate(from, .u)),
+                    .imm = decodeImmediate(from, .u),
                 },
             },
             0b1101111 => return .{
                 .jal = .{
                     .rd = try toRegisterChecked(decodeRd(from)),
-                    .imm = @truncate(decodeImmediate(from, .j)),
+                    .imm = decodeImmediate(from, .j),
                 },
             },
             0b1100111 => return .{
                 .jalr = .{
                     .rd = try toRegisterChecked(decodeRd(from)),
                     .rs1 = try toRegisterChecked(decodeRs1(from)),
-                    .imm = @truncate(decodeImmediate(from, .i)),
+                    .imm = decodeImmediate(from, .i),
                 },
             },
             0b1100011 => switch (funct3) {
@@ -1366,42 +1366,42 @@ pub const Instruction = union(enum) {
                     .beq = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .b)),
+                        .imm = decodeImmediate(from, .b),
                     },
                 },
                 0b001 => return .{
                     .bne = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .b)),
+                        .imm = decodeImmediate(from, .b),
                     },
                 },
                 0b100 => return .{
                     .blt = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .b)),
+                        .imm = decodeImmediate(from, .b),
                     },
                 },
                 0b101 => return .{
                     .bge = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .b)),
+                        .imm = decodeImmediate(from, .b),
                     },
                 },
                 0b110 => return .{
                     .bltu = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .b)),
+                        .imm = decodeImmediate(from, .b),
                     },
                 },
                 0b111 => return .{
                     .bgeu = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .b)),
+                        .imm = decodeImmediate(from, .b),
                     },
                 },
                 else => return DecodeError.UnknownInstruction,
@@ -1411,35 +1411,35 @@ pub const Instruction = union(enum) {
                     .lb = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b001 => return .{
                     .lh = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b010 => return .{
                     .lw = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b100 => return .{
                     .lbu = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b101 => return .{
                     .lhu = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 else => return DecodeError.UnknownInstruction,
@@ -1449,21 +1449,21 @@ pub const Instruction = union(enum) {
                     .sb = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .s)),
+                        .imm = decodeImmediate(from, .s),
                     },
                 },
                 0b001 => return .{
                     .sh = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .s)),
+                        .imm = decodeImmediate(from, .s),
                     },
                 },
                 0b010 => return .{
                     .sw = .{
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
                         .rs2 = try toRegisterChecked(decodeRs2(from)),
-                        .imm = @truncate(decodeImmediate(from, .s)),
+                        .imm = decodeImmediate(from, .s),
                     },
                 },
                 else => return DecodeError.UnknownInstruction,
@@ -1473,42 +1473,42 @@ pub const Instruction = union(enum) {
                     .addi = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b010 => return .{
                     .slti = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b011 => return .{
                     .sltiu = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b100 => return .{
                     .xori = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b110 => return .{
                     .ori = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b111 => return .{
                     .andi = .{
                         .rd = try toRegisterChecked(decodeRd(from)),
                         .rs1 = try toRegisterChecked(decodeRs1(from)),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b001 => switch (funct7) {
@@ -1901,14 +1901,14 @@ pub const Instruction = union(enum) {
                     .flw = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 0b011 => .{
                     .fld = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
-                        .imm = @truncate(decodeImmediate(from, .i)),
+                        .imm = decodeImmediate(from, .i),
                     },
                 },
                 else => DecodeError.UnknownInstruction,
@@ -1918,14 +1918,14 @@ pub const Instruction = union(enum) {
                     .fsw = .{
                         .rs1 = decodeRs1(from),
                         .rs2 = decodeRs2(from),
-                        .imm = @truncate(decodeImmediate(from, .s)),
+                        .imm = decodeImmediate(from, .s),
                     },
                 },
                 0b011 => .{
                     .fsd = .{
                         .rs1 = decodeRs1(from),
                         .rs2 = decodeRs2(from),
-                        .imm = @truncate(decodeImmediate(from, .s)),
+                        .imm = decodeImmediate(from, .s),
                     },
                 },
                 else => DecodeError.UnknownInstruction,
