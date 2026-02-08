@@ -347,8 +347,8 @@ pub const Mtvec = struct {
         mode: u2,
         base: u30,
 
-        pub fn address(self: Value) u32 {
-            return @as(u32, self.base) << 2;
+        pub fn address(this: Value) u32 {
+            return @as(u32, this.base) << 2;
         }
     };
 
@@ -422,12 +422,34 @@ pub const Mepc = struct {
     }
 };
 
-pub const Mcause = struct {
-    pub inline fn read() arch.Registers.Mcause {
+pub const Mcause = packed struct(u32) {
+    code: u31 = 0,
+    interrupt: bool = false,
+
+    pub const Exception = enum(u31) {
+        instruction_address_misaligned = 0,
+        instruction_access_fault = 1,
+        illegal_instruction = 2,
+        breakpoint = 3,
+        load_address_misaligned = 4,
+        load_access_fault = 5,
+        store_address_misaligned = 6,
+        store_access_fault = 7,
+        ecall_from_u = 8,
+        ecall_from_m = 11,
+    };
+
+    pub const Interrupt = enum(u31) {
+        machine_software = 3,
+        machine_timer = 7,
+        machine_external = 11,
+    };
+
+    pub inline fn read() Mcause {
         return @bitCast(Csr.read(.mcause));
     }
 
-    pub inline fn write(value: arch.Registers.Mcause) void {
+    pub inline fn write(value: Mcause) void {
         Csr.write(.mcause, @bitCast(value));
     }
 
@@ -451,22 +473,22 @@ pub const Mcause = struct {
         return read().code;
     }
 
-    pub inline fn getExceptionCode() arch.Registers.Mcause.Exception {
+    pub inline fn getExceptionCode() Exception {
         return @enumFromInt(read().code);
     }
 
-    pub inline fn getInterruptCode() arch.Registers.Mcause.Interrupt {
+    pub inline fn getInterruptCode() Interrupt {
         return @enumFromInt(read().code);
     }
 
-    pub inline fn setException(code: arch.Registers.Mcause.Exception) void {
+    pub inline fn setException(code: Exception) void {
         write(.{
             .code = @intFromEnum(code),
             .interrupt = false,
         });
     }
 
-    pub inline fn setInterrupt(code: arch.Registers.Mcause.Interrupt) void {
+    pub inline fn setInterrupt(code: Interrupt) void {
         write(.{
             .code = @intFromEnum(code),
             .interrupt = true,
