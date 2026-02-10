@@ -135,7 +135,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
         const ErrorCause = enum { instruction, load, store };
 
-        pub const ElfLoadError = error{OutOfRam} || elf.ParseError;
+        pub const ElfLoadError = error{ OutOfRam, NotSupported } || elf.ParseError;
 
         pub const TrapCause = union(enum) {
             exception: arch.Registers.Mcause.Exception,
@@ -259,11 +259,28 @@ pub inline fn Cpu(comptime config: Config) type {
             return .{ .trap = .{ .cause = .{ .exception = exception }, .tval = tval } };
         }
 
-        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8, offset: u32) ElfLoadError!void {
+        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8, offset: u32) ElfLoadError!usize {
             var file = try elf.File.parseFromSlice(allocator, content);
             defer file.deinit(allocator);
 
+            if (file.header.ident.class != .class32) {
+                return ElfLoadError.NotSupported;
+            }
+
+            if (file.header.ident.data != .lsb) {
+                return ElfLoadError.NotSupported;
+            }
+
+            if (file.header.machine != .riscv) {
+                return ElfLoadError.NotSupported;
+            }
+
+            if (file.header.ty != .exec and file.header.ty != .dyn) {
+                return ElfLoadError.NotSupported;
+            }
+
             const ventry = file.header.entry;
+            var max_addr: u32 = 0;
 
             for (file.program_headers.items) |*header| {
                 if (header.ty != .load) {
@@ -300,9 +317,13 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     @memset(this.ram[bss_start..][0..bss_size], 0);
                 }
+
+                max_addr = @max(max_addr, vaddr + header.memsz);
             }
 
             this.registers.pc = ventry;
+
+            return max_addr;
         }
 
         pub inline fn readMemory(this: *Self, address: u32, comptime T: type, comptime access: arch.Registers.Pmp.AccessType) MemoryError!T {

@@ -332,7 +332,7 @@ fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Conf
             };
 
             state.cpu.registers.mstatus.fs = 0b01;
-            state.cpu.loadElf(allocator, PROGRAM, 0) catch |err| {
+            _ = state.cpu.loadElf(allocator, PROGRAM, 0) catch |err| {
                 std.debug.print("failed to load the program: {t}\n", .{err});
 
                 return false;

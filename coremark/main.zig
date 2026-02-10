@@ -112,7 +112,7 @@ pub fn main() !void {
     var host: Host = try .init(alloc.allocator());
     defer host.deinit(alloc.allocator());
 
-    try host.cpu.loadElf(alloc.allocator(), COREMARK_GUEST, RAM_START);
+    _ = try host.cpu.loadElf(alloc.allocator(), COREMARK_GUEST, RAM_START);
 
     const start_time = std.time.nanoTimestamp();
     host.start_timestamp = start_time;
