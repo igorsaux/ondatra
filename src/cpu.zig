@@ -37,6 +37,16 @@ pub const Config = struct {
     };
 
     pub const Runtime = struct {
+        pub const Extensions = struct {
+            m: bool = true,
+            f: bool = true,
+            d: bool = true,
+            zba: bool = true,
+            zbb: bool = true,
+            zicsr: bool = true,
+            zicntr: bool = true,
+        };
+
         /// Enable Physical Memory Protection checks.
         /// Disable for ~2-3x speedup when running trusted code.
         enable_pmp: bool = true,
@@ -66,24 +76,11 @@ pub const Config = struct {
         /// Enable branch/jump target alignment checks (4-byte for RV32I).
         enable_branch_alignment: bool = true,
 
-        /// Enable floating-point extensions (F/D).
-        enable_fpu: bool = true,
-
         /// Enable FPU exception flags (NV, DZ, OF, UF, NX).
         /// When disabled, FCSR flags are not updated.
         enable_fpu_flags: bool = true,
 
-        /// Enable cycle/instret counter updates.
-        enable_counters: bool = true,
-
-        /// Enable M extension (multiply/divide)
-        enable_m_ext: bool = true,
-
-        /// Enable Zba extension (address generation)
-        enable_zba_ext: bool = true,
-
-        /// Enable Zbb extension (bit manipulation)
-        enable_zbb_ext: bool = true,
+        extensions: Extensions = .{},
 
         timer_ticks_per_step: u64 = 1,
 
@@ -221,10 +218,6 @@ pub inline fn Cpu(comptime config: Config) type {
         }
 
         pub inline fn checkFpuAccess(this: *Self) ?State {
-            if (comptime !config.runtime.enable_fpu) {
-                return trapState(.illegal_instruction, 0);
-            }
-
             if (this.registers.mstatus.fs == 0) {
                 return trapState(.illegal_instruction, 0);
             }
@@ -447,7 +440,7 @@ pub inline fn Cpu(comptime config: Config) type {
         }
 
         inline fn incCounters(this: *Self, comptime is_retired: bool) void {
-            if (comptime config.runtime.enable_counters) {
+            if (comptime config.runtime.extensions.zicntr) {
                 this.registers.cycle +%= 1;
 
                 if (is_retired) {
@@ -977,7 +970,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     return trapState(.breakpoint, this.registers.pc); // breakpoint: mtval = PC
                 },
                 .mul => |i| {
-                    if (comptime !config.runtime.enable_m_ext) {
+                    if (comptime !config.runtime.extensions.m) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -987,7 +980,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .mulh => |i| {
-                    if (comptime !config.runtime.enable_m_ext) {
+                    if (comptime !config.runtime.extensions.m) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -1000,7 +993,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .mulhsu => |i| {
-                    if (comptime !config.runtime.enable_m_ext) {
+                    if (comptime !config.runtime.extensions.m) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -1014,7 +1007,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .mulhu => |i| {
-                    if (comptime !config.runtime.enable_m_ext) {
+                    if (comptime !config.runtime.extensions.m) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -1027,7 +1020,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .div => |i| {
-                    if (comptime !config.runtime.enable_m_ext) {
+                    if (comptime !config.runtime.extensions.m) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -1046,7 +1039,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .divu => |i| {
-                    if (comptime !config.runtime.enable_m_ext) {
+                    if (comptime !config.runtime.extensions.m) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -1064,7 +1057,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .rem => |i| {
-                    if (comptime !config.runtime.enable_m_ext) {
+                    if (comptime !config.runtime.extensions.m) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -1084,7 +1077,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .remu => |i| {
-                    if (comptime !config.runtime.enable_m_ext) {
+                    if (comptime !config.runtime.extensions.m) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -1102,6 +1095,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .flw => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1122,6 +1119,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsw => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1142,6 +1143,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fadd_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1203,6 +1208,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsub_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1262,6 +1271,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmul_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1325,6 +1338,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fdiv_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1388,6 +1405,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsqrt_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1430,6 +1451,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmin_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1467,6 +1492,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmax_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1504,6 +1533,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsgnj_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1519,6 +1552,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsgnjn_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1534,6 +1571,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsgnjx_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1549,6 +1590,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .feq_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1577,6 +1622,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .flt_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1601,6 +1650,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fle_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1625,6 +1678,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_w_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1686,6 +1743,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_wu_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
                         return state;
@@ -1745,6 +1806,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_s_w => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1771,6 +1836,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_s_wu => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1797,6 +1866,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmv_x_w => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1809,6 +1882,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmv_w_x => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1822,6 +1899,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fclass_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1854,6 +1935,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmadd_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1920,6 +2005,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmsub_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -1984,6 +2073,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fnmsub_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2048,6 +2141,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fnmadd_s => |i| {
+                    if (comptime !config.runtime.extensions.f) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2112,6 +2209,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fld => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2132,6 +2233,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsd => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2151,6 +2256,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fadd_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2202,6 +2311,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsub_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2255,6 +2368,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmul_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2310,6 +2427,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fdiv_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2369,6 +2490,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsqrt_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2413,6 +2538,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmin_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2450,6 +2579,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmax_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2488,6 +2621,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsgnj_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2503,6 +2640,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsgnjn_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2518,6 +2659,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fsgnjx_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2533,6 +2678,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .feq_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2563,6 +2712,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .flt_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2588,6 +2741,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fle_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2612,6 +2769,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_w_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2673,6 +2834,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_wu_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2734,6 +2899,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_d_w => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2755,6 +2924,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_d_wu => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2776,6 +2949,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fclass_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2808,6 +2985,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmadd_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2875,6 +3056,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fmsub_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -2939,6 +3124,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fnmsub_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -3003,6 +3192,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fnmadd_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -3067,6 +3260,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_s_d => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -3116,6 +3313,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .fcvt_d_s => |i| {
+                    if (comptime !config.runtime.extensions.d) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     if (this.checkFpuAccess()) |state| {
                         this.incCounters(true);
 
@@ -3146,6 +3347,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .csrrw => |i| {
+                    if (comptime !config.runtime.extensions.zicsr) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
                     const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
 
@@ -3178,6 +3383,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .csrrs => |i| {
+                    if (comptime !config.runtime.extensions.zicsr) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
@@ -3213,6 +3422,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .csrrc => |i| {
+                    if (comptime !config.runtime.extensions.zicsr) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
@@ -3248,6 +3461,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .csrrwi => |i| {
+                    if (comptime !config.runtime.extensions.zicsr) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
@@ -3279,6 +3496,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .csrrsi => |i| {
+                    if (comptime !config.runtime.extensions.zicsr) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
@@ -3310,6 +3531,10 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .csrrci => |i| {
+                    if (comptime !config.runtime.extensions.zicsr) {
+                        return trapState(.illegal_instruction, 0);
+                    }
+
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
@@ -3344,7 +3569,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .sh1add => |i| {
-                    if (comptime !config.runtime.enable_zba_ext) {
+                    if (comptime !config.runtime.extensions.zba) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3357,7 +3582,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .sh2add => |i| {
-                    if (comptime !config.runtime.enable_zba_ext) {
+                    if (comptime !config.runtime.extensions.zba) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3370,7 +3595,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .sh3add => |i| {
-                    if (comptime !config.runtime.enable_zba_ext) {
+                    if (comptime !config.runtime.extensions.zba) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3383,7 +3608,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .andn => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3396,7 +3621,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .orn => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3409,7 +3634,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .xnor => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3422,7 +3647,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .clz => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3434,7 +3659,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .ctz => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3446,7 +3671,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .cpop => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3458,7 +3683,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .max => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3471,7 +3696,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .maxu => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3484,7 +3709,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .min => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3497,7 +3722,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .minu => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3510,7 +3735,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .sext_b => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3523,7 +3748,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .sext_h => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3536,7 +3761,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .zext_h => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3548,7 +3773,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .rol => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3561,7 +3786,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .ror => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3574,7 +3799,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .rori => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3586,7 +3811,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .orc_b => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
@@ -3607,7 +3832,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.registers.pc +%= 4;
                 },
                 .rev8 => |i| {
-                    if (comptime !config.runtime.enable_zbb_ext) {
+                    if (comptime !config.runtime.extensions.zbb) {
                         this.incCounters(true);
 
                         return trapState(.illegal_instruction, 0);
