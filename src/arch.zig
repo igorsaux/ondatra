@@ -257,7 +257,7 @@ pub const Registers = struct {
         // WPRI mask: bits that must preserve value on write
         pub const WPRI_MASK: u32 = 0x007F_E1E5;
         // Writable bits mask for M+U system
-        pub const WRITE_MASK: u32 = 0x0002_7888; // MIE, MPIE, MPP, FS, MPRV
+        pub const WRITE_MASK: u32 = 0x0022_7888; // MIE, MPIE, MPP, FS, MPRV, TW
 
         pub inline fn updateSD(this: *Mstatus) void {
             this.sd = (this.fs == 0b11) or (this.xs == 0b11) or (this.vs == 0b11);
@@ -289,7 +289,7 @@ pub const Registers = struct {
         code: u31 = 0,
         interrupt: bool = false,
 
-        pub const Exception = enum(u31) {
+        pub const Exception = enum(u32) {
             instruction_address_misaligned = 0,
             instruction_access_fault = 1,
             illegal_instruction = 2,
@@ -302,18 +302,26 @@ pub const Registers = struct {
             ecall_from_m = 11,
         };
 
-        pub const Interrupt = enum(u31) {
+        pub const Interrupt = enum(u32) {
             machine_software = 3,
             machine_timer = 7,
             machine_external = 11,
         };
 
         pub inline fn fromException(code: Exception) Mcause {
-            return .{ .code = @intFromEnum(code), .interrupt = false };
+            return .{ .code = @intCast(@intFromEnum(code)), .interrupt = false };
         }
 
         pub inline fn fromInterrupt(code: Interrupt) Mcause {
-            return .{ .code = @intFromEnum(code), .interrupt = true };
+            return .{ .code = @intCast(@intFromEnum(code)), .interrupt = true };
+        }
+
+        pub inline fn toException(this: Mcause) ?Exception {
+            if (this.interrupt) {
+                return null;
+            }
+
+            return std.meta.intToEnum(Exception, this.code) catch null;
         }
     };
 
@@ -630,6 +638,8 @@ pub const Registers = struct {
         access_type: Pmp.AccessType,
         priv: PrivilegeLevel,
     ) bool {
+        @setEvalBranchQuota(std.math.maxInt(u32));
+
         // MPRV only affects load/store, not instruction fetch (execute)
         const effective_priv: PrivilegeLevel = if (priv == .machine and
             this.mstatus.mprv and
@@ -747,7 +757,7 @@ pub const Registers = struct {
             .pmpaddr13 => this.pmpaddr[13],
             .pmpaddr14 => this.pmpaddr[14],
             .pmpaddr15 => this.pmpaddr[15],
-            else => 0, // Unknown CSR reads as 0
+            else => return Csr.Error.IllegalInstruction,
         };
     }
 
@@ -836,8 +846,7 @@ pub const Registers = struct {
             .pmpaddr13 => this.writePmpaddr(13, value),
             .pmpaddr14 => this.writePmpaddr(14, value),
             .pmpaddr15 => this.writePmpaddr(15, value),
-            // Read-only or user counters - ignore writes
-            else => {},
+            else => return Csr.Error.IllegalInstruction,
         }
     }
 
@@ -962,7 +971,12 @@ pub const Registers = struct {
     }
 
     pub inline fn getPendingInterrupt(this: *Registers) ?Mcause.Interrupt {
-        if (!this.mstatus.mie) return null;
+        const priv = this.privilege.sanitize();
+        const can_interrupt = this.mstatus.mie or (priv == .user);
+
+        if (!can_interrupt) {
+            return null;
+        }
 
         if (this.mip.meip and this.mie.meie) {
             return .machine_external;
@@ -1059,7 +1073,7 @@ pub const Registers = struct {
 pub const Instruction = union(enum) {
     pub const DecodeError = error{ UnknownInstruction, BadRegister };
 
-    // RV32I
+    // I
     lui: struct { rd: u8, imm: i32 },
     auipc: struct { rd: u8, imm: i32 },
     jal: struct { rd: u8, imm: i32 },
@@ -1100,7 +1114,7 @@ pub const Instruction = union(enum) {
     fence: void,
     ecall: void,
     ebreak: void,
-    // RV32M
+    // M
     mul: struct { rd: u8, rs1: u8, rs2: u8 },
     mulh: struct { rd: u8, rs1: u8, rs2: u8 },
     mulhsu: struct { rd: u8, rs1: u8, rs2: u8 },
@@ -1109,7 +1123,7 @@ pub const Instruction = union(enum) {
     divu: struct { rd: u8, rs1: u8, rs2: u8 },
     rem: struct { rd: u8, rs1: u8, rs2: u8 },
     remu: struct { rd: u8, rs1: u8, rs2: u8 },
-    // RV32F
+    // F
     flw: struct { rd: u8, rs1: u8, imm: i32 },
     fsw: struct { rs1: u8, rs2: u8, imm: i32 },
     fmadd_s: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
@@ -1136,33 +1150,6 @@ pub const Instruction = union(enum) {
     fcvt_s_w: struct { rd: u8, rs1: u8, rm: u3 },
     fcvt_s_wu: struct { rd: u8, rs1: u8, rm: u3 },
     fmv_w_x: struct { rd: u8, rs1: u8 },
-    // RV32D
-    fld: struct { rd: u8, rs1: u8, imm: i32 },
-    fsd: struct { rs1: u8, rs2: u8, imm: i32 },
-    fmadd_d: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
-    fmsub_d: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
-    fnmsub_d: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
-    fnmadd_d: struct { rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u3 },
-    fadd_d: struct { rd: u8, rs1: u8, rs2: u8, rm: u3 },
-    fsub_d: struct { rd: u8, rs1: u8, rs2: u8, rm: u3 },
-    fmul_d: struct { rd: u8, rs1: u8, rs2: u8, rm: u3 },
-    fdiv_d: struct { rd: u8, rs1: u8, rs2: u8, rm: u3 },
-    fsqrt_d: struct { rd: u8, rs1: u8, rm: u3 },
-    fsgnj_d: struct { rd: u8, rs1: u8, rs2: u8 },
-    fsgnjn_d: struct { rd: u8, rs1: u8, rs2: u8 },
-    fsgnjx_d: struct { rd: u8, rs1: u8, rs2: u8 },
-    fmin_d: struct { rd: u8, rs1: u8, rs2: u8 },
-    fmax_d: struct { rd: u8, rs1: u8, rs2: u8 },
-    fcvt_s_d: struct { rd: u8, rs1: u8, rm: u3 },
-    fcvt_d_s: struct { rd: u8, rs1: u8, rm: u3 },
-    feq_d: struct { rd: u8, rs1: u8, rs2: u8 },
-    flt_d: struct { rd: u8, rs1: u8, rs2: u8 },
-    fle_d: struct { rd: u8, rs1: u8, rs2: u8 },
-    fclass_d: struct { rd: u8, rs1: u8 },
-    fcvt_w_d: struct { rd: u8, rs1: u8, rm: u3 },
-    fcvt_wu_d: struct { rd: u8, rs1: u8, rm: u3 },
-    fcvt_d_w: struct { rd: u8, rs1: u8, rm: u3 },
-    fcvt_d_wu: struct { rd: u8, rs1: u8, rm: u3 },
     // Zicsr
     csrrw: struct { rd: u8, rs1: u8, csr: u12 },
     csrrs: struct { rd: u8, rs1: u8, csr: u12 },
@@ -1904,13 +1891,6 @@ pub const Instruction = union(enum) {
                         .imm = decodeImmediate(from, .i),
                     },
                 },
-                0b011 => .{
-                    .fld = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .imm = decodeImmediate(from, .i),
-                    },
-                },
                 else => DecodeError.UnknownInstruction,
             },
             0b0100111 => switch (funct3) {
@@ -1921,27 +1901,11 @@ pub const Instruction = union(enum) {
                         .imm = decodeImmediate(from, .s),
                     },
                 },
-                0b011 => .{
-                    .fsd = .{
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .imm = decodeImmediate(from, .s),
-                    },
-                },
                 else => DecodeError.UnknownInstruction,
             },
             0b1000011 => switch (decodeFmt(from)) {
                 0b00 => .{
                     .fmadd_s = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .rs3 = decodeRs3(from),
-                        .rm = funct3,
-                    },
-                },
-                0b01 => .{
-                    .fmadd_d = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
                         .rs2 = decodeRs2(from),
@@ -1961,15 +1925,6 @@ pub const Instruction = union(enum) {
                         .rm = funct3,
                     },
                 },
-                0b01 => .{
-                    .fmsub_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .rs3 = decodeRs3(from),
-                        .rm = funct3,
-                    },
-                },
                 else => DecodeError.UnknownInstruction,
             },
             0b1001011 => switch (decodeFmt(from)) {
@@ -1982,29 +1937,11 @@ pub const Instruction = union(enum) {
                         .rm = funct3,
                     },
                 },
-                0b01 => .{
-                    .fnmsub_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .rs3 = decodeRs3(from),
-                        .rm = funct3,
-                    },
-                },
                 else => DecodeError.UnknownInstruction,
             },
             0b1001111 => switch (decodeFmt(from)) {
                 0b00 => .{
                     .fnmadd_s = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .rs3 = decodeRs3(from),
-                        .rm = funct3,
-                    },
-                },
-                0b01 => .{
-                    .fnmadd_d = .{
                         .rd = decodeRd(from),
                         .rs1 = decodeRs1(from),
                         .rs2 = decodeRs2(from),
@@ -2174,164 +2111,6 @@ pub const Instruction = union(enum) {
                         .rs1 = decodeRs1(from),
                     },
                 } else DecodeError.UnknownInstruction,
-                0b0000001 => .{
-                    .fadd_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .rm = funct3,
-                    },
-                },
-                0b0000101 => .{
-                    .fsub_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .rm = funct3,
-                    },
-                },
-                0b0001001 => .{
-                    .fmul_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .rm = funct3,
-                    },
-                },
-                0b0001101 => .{
-                    .fdiv_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rs2 = decodeRs2(from),
-                        .rm = funct3,
-                    },
-                },
-                0b0101101 => if (decodeRs2(from) == 0) .{
-                    .fsqrt_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rm = funct3,
-                    },
-                } else DecodeError.UnknownInstruction,
-                0b0010001 => switch (funct3) {
-                    0b000 => .{
-                        .fsgnj_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rs2 = decodeRs2(from),
-                        },
-                    },
-                    0b001 => .{
-                        .fsgnjn_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rs2 = decodeRs2(from),
-                        },
-                    },
-                    0b010 => .{
-                        .fsgnjx_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rs2 = decodeRs2(from),
-                        },
-                    },
-                    else => DecodeError.UnknownInstruction,
-                },
-                0b0010101 => switch (funct3) {
-                    0b000 => .{
-                        .fmin_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rs2 = decodeRs2(from),
-                        },
-                    },
-                    0b001 => .{
-                        .fmax_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rs2 = decodeRs2(from),
-                        },
-                    },
-                    else => DecodeError.UnknownInstruction,
-                },
-                0b0100000 => if (decodeRs2(from) == 0b00001) .{
-                    .fcvt_s_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rm = funct3,
-                    },
-                } else DecodeError.UnknownInstruction,
-                0b0100001 => if (decodeRs2(from) == 0b00000) .{
-                    .fcvt_d_s = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                        .rm = funct3,
-                    },
-                } else DecodeError.UnknownInstruction,
-                0b1010001 => switch (funct3) {
-                    0b010 => .{
-                        .feq_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rs2 = decodeRs2(from),
-                        },
-                    },
-                    0b001 => .{
-                        .flt_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rs2 = decodeRs2(from),
-                        },
-                    },
-                    0b000 => .{
-                        .fle_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rs2 = decodeRs2(from),
-                        },
-                    },
-                    else => DecodeError.UnknownInstruction,
-                },
-                0b1110001 => if (decodeRs2(from) == 0 and funct3 == 0b001) .{
-                    .fclass_d = .{
-                        .rd = decodeRd(from),
-                        .rs1 = decodeRs1(from),
-                    },
-                } else DecodeError.UnknownInstruction,
-                0b1100001 => switch (decodeRs2(from)) {
-                    0b00000 => .{
-                        .fcvt_w_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rm = funct3,
-                        },
-                    },
-                    0b00001 => .{
-                        .fcvt_wu_d = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rm = funct3,
-                        },
-                    },
-                    else => DecodeError.UnknownInstruction,
-                },
-                0b1101001 => switch (decodeRs2(from)) {
-                    0b00000 => .{
-                        .fcvt_d_w = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rm = funct3,
-                        },
-                    },
-                    0b00001 => .{
-                        .fcvt_d_wu = .{
-                            .rd = decodeRd(from),
-                            .rs1 = decodeRs1(from),
-                            .rm = funct3,
-                        },
-                    },
-                    else => DecodeError.UnknownInstruction,
-                },
                 else => DecodeError.UnknownInstruction,
             },
             else => return DecodeError.UnknownInstruction,
@@ -2740,158 +2519,6 @@ pub const Instruction = union(enum) {
                 encodeFunct3(0b000) |
                 encodeRs1(i.rs1) |
                 encodeFunct7(0b1111000),
-            .fld => |i| encodeOpcode(0b0000111) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b011) |
-                encodeRs1(i.rs1) |
-                encodeImmediate(i.imm, .i),
-            .fsd => |i| encodeOpcode(0b0100111) |
-                encodeFunct3(0b011) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeImmediate(i.imm, .s),
-            .fmadd_d => |i| encodeOpcode(0b1000011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeRs3(i.rs3) |
-                encodeFmt(0b01),
-            .fmsub_d => |i| encodeOpcode(0b1000111) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeRs3(i.rs3) |
-                encodeFmt(0b01),
-            .fnmsub_d => |i| encodeOpcode(0b1001011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeRs3(i.rs3) |
-                encodeFmt(0b01),
-            .fnmadd_d => |i| encodeOpcode(0b1001111) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeRs3(i.rs3) |
-                encodeFmt(0b01),
-            .fadd_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0000001),
-            .fsub_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0000101),
-            .fmul_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0001001),
-            .fdiv_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0001101),
-            .fsqrt_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeFunct7(0b0101101),
-            .fsgnj_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b000) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0010001),
-            .fsgnjn_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b001) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0010001),
-            .fsgnjx_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b010) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0010001),
-            .fmin_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b000) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0010101),
-            .fmax_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b001) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b0010101),
-            .fcvt_s_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(1) | encodeFunct7(0b0100000),
-            .fcvt_d_s => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeFunct7(0b0100001),
-            .feq_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b010) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b1010001),
-            .flt_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b001) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b1010001),
-            .fle_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b000) |
-                encodeRs1(i.rs1) |
-                encodeRs2(i.rs2) |
-                encodeFunct7(0b1010001),
-            .fclass_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(0b001) |
-                encodeRs1(i.rs1) |
-                encodeFunct7(0b1110001),
-            .fcvt_w_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeFunct7(0b1100001),
-            .fcvt_wu_d => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(1) |
-                encodeFunct7(0b1100001),
-            .fcvt_d_w => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeFunct7(0b1101001),
-            .fcvt_d_wu => |i| encodeOpcode(0b1010011) |
-                encodeRd(i.rd) |
-                encodeFunct3(i.rm) |
-                encodeRs1(i.rs1) |
-                encodeRs2(1) |
-                encodeFunct7(0b1101001),
             .csrrw => |i| encodeOpcode(0b1110011) |
                 encodeRd(i.rd) |
                 encodeFunct3(0b001) |
@@ -3051,6 +2678,13 @@ pub const Instruction = union(enum) {
         };
     }
 
+    pub inline fn isControlFlow(this: Instruction) bool {
+        return switch (this) {
+            .jal, .jalr, .beq, .bne, .blt, .bge, .bltu, .bgeu, .ecall, .ebreak => true,
+            else => false,
+        };
+    }
+
     pub inline fn format(this: Instruction, writer: anytype) !void {
         switch (this) {
             .lui => |i| try writer.print("lui {s}, {d}", .{ Registers.getAbiName(i.rd), i.imm }),
@@ -3127,32 +2761,6 @@ pub const Instruction = union(enum) {
             .fcvt_s_w => |i| try writer.print("fcvt.s.w {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getAbiName(i.rs1) }),
             .fcvt_s_wu => |i| try writer.print("fcvt.s.wu {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getAbiName(i.rs1) }),
             .fmv_w_x => |i| try writer.print("fmv.w.x {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getAbiName(i.rs1) }),
-            .fld => |i| try writer.print("fld {s}, {d}({s})", .{ Registers.getFloatAbiName(i.rd), i.imm, Registers.getAbiName(i.rs1) }),
-            .fsd => |i| try writer.print("fsd {s}, {d}({s})", .{ Registers.getFloatAbiName(i.rs2), i.imm, Registers.getAbiName(i.rs1) }),
-            .fmadd_d => |i| try writer.print("fmadd.d {s}, {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2), Registers.getFloatAbiName(i.rs3) }),
-            .fmsub_d => |i| try writer.print("fmsub.d {s}, {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2), Registers.getFloatAbiName(i.rs3) }),
-            .fnmsub_d => |i| try writer.print("fnmsub.d {s}, {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2), Registers.getFloatAbiName(i.rs3) }),
-            .fnmadd_d => |i| try writer.print("fnmadd.d {s}, {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2), Registers.getFloatAbiName(i.rs3) }),
-            .fadd_d => |i| try writer.print("fadd.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fsub_d => |i| try writer.print("fsub.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fmul_d => |i| try writer.print("fmul.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fdiv_d => |i| try writer.print("fdiv.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fsqrt_d => |i| try writer.print("fsqrt.d {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1) }),
-            .fsgnj_d => |i| try writer.print("fsgnj.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fsgnjn_d => |i| try writer.print("fsgnjn.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fsgnjx_d => |i| try writer.print("fsgnjx.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fmin_d => |i| try writer.print("fmin.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fmax_d => |i| try writer.print("fmax.d {s}, {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fcvt_s_d => |i| try writer.print("fcvt.s.d {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1) }),
-            .fcvt_d_s => |i| try writer.print("fcvt.d.s {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getFloatAbiName(i.rs1) }),
-            .feq_d => |i| try writer.print("feq.d {s}, {s}, {s}", .{ Registers.getAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .flt_d => |i| try writer.print("flt.d {s}, {s}, {s}", .{ Registers.getAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fle_d => |i| try writer.print("fle.d {s}, {s}, {s}", .{ Registers.getAbiName(i.rd), Registers.getFloatAbiName(i.rs1), Registers.getFloatAbiName(i.rs2) }),
-            .fclass_d => |i| try writer.print("fclass.d {s}, {s}", .{ Registers.getAbiName(i.rd), Registers.getFloatAbiName(i.rs1) }),
-            .fcvt_w_d => |i| try writer.print("fcvt.w.d {s}, {s}", .{ Registers.getAbiName(i.rd), Registers.getFloatAbiName(i.rs1) }),
-            .fcvt_wu_d => |i| try writer.print("fcvt.wu.d {s}, {s}", .{ Registers.getAbiName(i.rd), Registers.getFloatAbiName(i.rs1) }),
-            .fcvt_d_w => |i| try writer.print("fcvt.d.w {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getAbiName(i.rs1) }),
-            .fcvt_d_wu => |i| try writer.print("fcvt.d.wu {s}, {s}", .{ Registers.getFloatAbiName(i.rd), Registers.getAbiName(i.rs1) }),
             .csrrw => |i| try writer.print("csrrw {s}, 0x{x:0>3}, {s}", .{ Registers.getAbiName(i.rd), i.csr, Registers.getAbiName(i.rs1) }),
             .csrrs => |i| try writer.print("csrrs {s}, 0x{x:0>3}, {s}", .{ Registers.getAbiName(i.rd), i.csr, Registers.getAbiName(i.rs1) }),
             .csrrc => |i| try writer.print("csrrc {s}, 0x{x:0>3}, {s}", .{ Registers.getAbiName(i.rd), i.csr, Registers.getAbiName(i.rs1) }),
@@ -4264,526 +3872,6 @@ test "Instruction fmv_w_x high registers encode & decode" {
     try std.testing.expectEqual(raw, actual.encode());
 }
 
-test "Instruction fld encode & decode" {
-    const expected: Instruction = .{ .fld = .{ .rd = 5, .rs1 = 10, .imm = 256 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fld negative offset encode & decode" {
-    const expected: Instruction = .{ .fld = .{ .rd = 8, .rs1 = 2, .imm = -128 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsd encode & decode" {
-    const expected: Instruction = .{ .fsd = .{ .rs1 = 10, .rs2 = 5, .imm = 128 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsd negative offset encode & decode" {
-    const expected: Instruction = .{ .fsd = .{ .rs1 = 2, .rs2 = 8, .imm = -64 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmadd_d encode & decode" {
-    const expected: Instruction = .{ .fmadd_d = .{ .rd = 1, .rs1 = 2, .rs2 = 3, .rs3 = 4, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmadd_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fmadd_d = .{ .rd = 10, .rs1 = 11, .rs2 = 12, .rs3 = 13, .rm = 3 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmsub_d encode & decode" {
-    const expected: Instruction = .{ .fmsub_d = .{ .rd = 5, .rs1 = 6, .rs2 = 7, .rs3 = 8, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmsub_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fmsub_d = .{ .rd = 15, .rs1 = 16, .rs2 = 17, .rs3 = 18, .rm = 2 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fnmsub_d encode & decode" {
-    const expected: Instruction = .{ .fnmsub_d = .{ .rd = 9, .rs1 = 10, .rs2 = 11, .rs3 = 12, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fnmsub_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fnmsub_d = .{ .rd = 20, .rs1 = 21, .rs2 = 22, .rs3 = 23, .rm = 4 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fnmadd_d encode & decode" {
-    const expected: Instruction = .{ .fnmadd_d = .{ .rd = 13, .rs1 = 14, .rs2 = 15, .rs3 = 16, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fnmadd_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fnmadd_d = .{ .rd = 25, .rs1 = 26, .rs2 = 27, .rs3 = 28, .rm = 1 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fadd_d encode & decode" {
-    const expected: Instruction = .{ .fadd_d = .{ .rd = 1, .rs1 = 2, .rs2 = 3, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fadd_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fadd_d = .{ .rd = 10, .rs1 = 11, .rs2 = 12, .rm = 7 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsub_d encode & decode" {
-    const expected: Instruction = .{ .fsub_d = .{ .rd = 4, .rs1 = 5, .rs2 = 6, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsub_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fsub_d = .{ .rd = 14, .rs1 = 15, .rs2 = 16, .rm = 2 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmul_d encode & decode" {
-    const expected: Instruction = .{ .fmul_d = .{ .rd = 7, .rs1 = 8, .rs2 = 9, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmul_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fmul_d = .{ .rd = 17, .rs1 = 18, .rs2 = 19, .rm = 3 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fdiv_d encode & decode" {
-    const expected: Instruction = .{ .fdiv_d = .{ .rd = 10, .rs1 = 11, .rs2 = 12, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fdiv_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fdiv_d = .{ .rd = 20, .rs1 = 21, .rs2 = 22, .rm = 4 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsqrt_d encode & decode" {
-    const expected: Instruction = .{ .fsqrt_d = .{ .rd = 1, .rs1 = 2, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsqrt_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fsqrt_d = .{ .rd = 15, .rs1 = 16, .rm = 1 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsgnj_d encode & decode" {
-    const expected: Instruction = .{ .fsgnj_d = .{ .rd = 1, .rs1 = 2, .rs2 = 3 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsgnj_d same registers (fmv.d) encode & decode" {
-    const expected: Instruction = .{ .fsgnj_d = .{ .rd = 5, .rs1 = 10, .rs2 = 10 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsgnjn_d encode & decode" {
-    const expected: Instruction = .{ .fsgnjn_d = .{ .rd = 4, .rs1 = 5, .rs2 = 6 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsgnjn_d same registers (fneg.d) encode & decode" {
-    const expected: Instruction = .{ .fsgnjn_d = .{ .rd = 8, .rs1 = 12, .rs2 = 12 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsgnjx_d encode & decode" {
-    const expected: Instruction = .{ .fsgnjx_d = .{ .rd = 7, .rs1 = 8, .rs2 = 9 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsgnjx_d same registers (fabs.d) encode & decode" {
-    const expected: Instruction = .{ .fsgnjx_d = .{ .rd = 10, .rs1 = 15, .rs2 = 15 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmin_d encode & decode" {
-    const expected: Instruction = .{ .fmin_d = .{ .rd = 1, .rs1 = 2, .rs2 = 3 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmin_d high registers encode & decode" {
-    const expected: Instruction = .{ .fmin_d = .{ .rd = 28, .rs1 = 29, .rs2 = 30 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmax_d encode & decode" {
-    const expected: Instruction = .{ .fmax_d = .{ .rd = 4, .rs1 = 5, .rs2 = 6 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmax_d high registers encode & decode" {
-    const expected: Instruction = .{ .fmax_d = .{ .rd = 25, .rs1 = 26, .rs2 = 27 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_s_d encode & decode" {
-    const expected: Instruction = .{ .fcvt_s_d = .{ .rd = 1, .rs1 = 2, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_s_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fcvt_s_d = .{ .rd = 15, .rs1 = 20, .rm = 1 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_d_s encode & decode" {
-    const expected: Instruction = .{ .fcvt_d_s = .{ .rd = 3, .rs1 = 4, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_d_s with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fcvt_d_s = .{ .rd = 25, .rs1 = 30, .rm = 7 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction feq_d encode & decode" {
-    const expected: Instruction = .{ .feq_d = .{ .rd = 1, .rs1 = 2, .rs2 = 3 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction feq_d high registers encode & decode" {
-    const expected: Instruction = .{ .feq_d = .{ .rd = 15, .rs1 = 20, .rs2 = 25 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction flt_d encode & decode" {
-    const expected: Instruction = .{ .flt_d = .{ .rd = 4, .rs1 = 5, .rs2 = 6 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction flt_d high registers encode & decode" {
-    const expected: Instruction = .{ .flt_d = .{ .rd = 10, .rs1 = 28, .rs2 = 29 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fle_d encode & decode" {
-    const expected: Instruction = .{ .fle_d = .{ .rd = 7, .rs1 = 8, .rs2 = 9 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fle_d high registers encode & decode" {
-    const expected: Instruction = .{ .fle_d = .{ .rd = 5, .rs1 = 30, .rs2 = 31 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fclass_d encode & decode" {
-    const expected: Instruction = .{ .fclass_d = .{ .rd = 1, .rs1 = 2 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fclass_d high registers encode & decode" {
-    const expected: Instruction = .{ .fclass_d = .{ .rd = 25, .rs1 = 30 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_w_d encode & decode" {
-    const expected: Instruction = .{ .fcvt_w_d = .{ .rd = 1, .rs1 = 2, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_w_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fcvt_w_d = .{ .rd = 10, .rs1 = 15, .rm = 1 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_wu_d encode & decode" {
-    const expected: Instruction = .{ .fcvt_wu_d = .{ .rd = 3, .rs1 = 4, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_wu_d with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fcvt_wu_d = .{ .rd = 20, .rs1 = 25, .rm = 2 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_d_w encode & decode" {
-    const expected: Instruction = .{ .fcvt_d_w = .{ .rd = 1, .rs1 = 2, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_d_w with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fcvt_d_w = .{ .rd = 15, .rs1 = 20, .rm = 7 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_d_wu encode & decode" {
-    const expected: Instruction = .{ .fcvt_d_wu = .{ .rd = 5, .rs1 = 6, .rm = 0 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fcvt_d_wu with rounding mode encode & decode" {
-    const expected: Instruction = .{ .fcvt_d_wu = .{ .rd = 25, .rs1 = 30, .rm = 4 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
 test "Instruction flw max positive offset encode & decode" {
     const expected: Instruction = .{ .flw = .{ .rd = 31, .rs1 = 31, .imm = 2047 } };
 
@@ -4826,56 +3914,6 @@ test "Instruction fsw max negative offset encode & decode" {
 
 test "Instruction fmadd_s all max registers encode & decode" {
     const expected: Instruction = .{ .fmadd_s = .{ .rd = 31, .rs1 = 31, .rs2 = 31, .rs3 = 31, .rm = 7 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fmadd_d all max registers encode & decode" {
-    const expected: Instruction = .{ .fmadd_d = .{ .rd = 31, .rs1 = 31, .rs2 = 31, .rs3 = 31, .rm = 7 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fld max positive offset encode & decode" {
-    const expected: Instruction = .{ .fld = .{ .rd = 31, .rs1 = 31, .imm = 2047 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fld max negative offset encode & decode" {
-    const expected: Instruction = .{ .fld = .{ .rd = 0, .rs1 = 0, .imm = -2048 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsd max positive offset encode & decode" {
-    const expected: Instruction = .{ .fsd = .{ .rs1 = 31, .rs2 = 31, .imm = 2047 } };
-
-    const raw: u32 = expected.encode();
-    const actual: Instruction = try Instruction.decode(raw);
-
-    try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(raw, actual.encode());
-}
-
-test "Instruction fsd max negative offset encode & decode" {
-    const expected: Instruction = .{ .fsd = .{ .rs1 = 0, .rs2 = 0, .imm = -2048 } };
 
     const raw: u32 = expected.encode();
     const actual: Instruction = try Instruction.decode(raw);

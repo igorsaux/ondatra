@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Igor Spichkin
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const ondatra = @import("ondatra");
 
@@ -9,15 +12,13 @@ const RAM_START: u32 = 0x80000000;
 var STDERR_BUFFER: [std.math.pow(usize, 2, 20)]u8 = undefined;
 
 const Host = struct {
-    const Cpu = ondatra.cpu.Cpu(.{
+    const Cpu = ondatra.jit.Cpu(.{
+        .vars = .{
+            .ram_start = RAM_START,
+        },
         .hooks = .{
-            .isMmio = isMmio,
-            .readTranslate = readTranslate,
-            .writeTranslate = readTranslate,
             .ecall = ecall,
         },
-        .compile = .fast_execution,
-        .runtime = .compliant,
     });
 
     cpu: Cpu,
@@ -26,7 +27,7 @@ const Host = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Host {
         const ram: []u8 = try allocator.alloc(u8, std.math.pow(usize, 2, 24));
-        const cpu: Cpu = .init(ram);
+        const cpu: Cpu = try .init(allocator, ram);
         const writer = std.fs.File.stderr().writer(&STDERR_BUFFER);
 
         return .{
@@ -42,10 +43,10 @@ const Host = struct {
         allocator.free(this.cpu.ram);
     }
 
-    inline fn ecall(
+    fn ecall(
         ctx: *anyopaque,
         cause: ondatra.arch.Registers.Mcause.Exception,
-    ) ondatra.cpu.Config.Hooks.Action {
+    ) callconv(.c) ondatra.jit.EngineConfig.Hooks.Action {
         _ = cause;
 
         const cpu: *Cpu = @ptrCast(@alignCast(ctx));
@@ -112,13 +113,13 @@ pub fn main() !void {
     var host: Host = try .init(alloc.allocator());
     defer host.deinit(alloc.allocator());
 
-    _ = try host.cpu.loadElf(alloc.allocator(), COREMARK_GUEST, RAM_START);
+    _ = try host.cpu.loadElf(alloc.allocator(), COREMARK_GUEST);
 
     const start_time = std.time.nanoTimestamp();
     host.start_timestamp = start_time;
 
     run: while (true) {
-        switch (host.cpu.run(std.math.maxInt(usize))) {
+        switch (try host.cpu.run(std.math.maxInt(u64))) {
             .ok => continue,
             .halt => {
                 break :run;
