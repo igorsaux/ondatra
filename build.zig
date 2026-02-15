@@ -63,6 +63,31 @@ pub fn build(b: *std.Build) void {
         coremark_interpreter_cmd.addArgs(args);
     }
 
+    const coremark_jit = b.addExecutable(.{
+        .name = "coremark_jit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("coremark/jit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ondatra", .module = mod },
+            },
+        }),
+    });
+
+    addCoremarkGuest(b, coremark_jit, "50000");
+
+    b.installArtifact(coremark_jit);
+
+    const coremark_jit_step = b.step("coremark_jit", "Run the coremark benchmark");
+
+    const coremark_jit_cmd = b.addRunArtifact(coremark_jit);
+    coremark_jit_step.dependOn(&coremark_jit_cmd.step);
+
+    if (b.args) |args| {
+        coremark_jit_cmd.addArgs(args);
+    }
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

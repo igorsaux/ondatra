@@ -260,12 +260,20 @@ pub fn main() !void {
     const benchs = [_]Benchmark{
         .{ .name = "fibbonacci_compliant", .func = fibbonacciCompliantBenchmark },
         .{ .name = "fibbonacci_fast", .func = fibbonacciFastBenchmark },
+        .{ .name = "fibbonacci_jit_compliant", .func = fibbonacciJitCompliantBenchmark },
+        .{ .name = "fibbonacci_jit_fast", .func = fibbonacciJitFastBenchmark },
         .{ .name = "floatMinMaxAbs_compliant", .func = floatMinMaxAbsCompliantBenchmark },
         .{ .name = "floatMinMaxAbs_fast", .func = floatMinMaxAbsFastBenchmark },
+        .{ .name = "floatMinMaxAbs_jit_compliant", .func = floatMinMaxAbsJitCompliantBenchmark },
+        .{ .name = "floatMinMaxAbs_jit_fast", .func = floatMinMaxAbsJitFastBenchmark },
         .{ .name = "floatArithmetic_compliant", .func = floatArithmeticCompliantBenchmark },
         .{ .name = "floatArithmetic_fast", .func = floatArithmeticFastBenchmark },
+        .{ .name = "floatArithmetic_jit_compliant", .func = floatArithmeticJitCompliantBenchmark },
+        .{ .name = "floatArithmetic_jit_fast", .func = floatArithmeticJitFastBenchmark },
         .{ .name = "floatSqrtFma_compliant", .func = floatSqrtFmaCompliantBenchmark },
         .{ .name = "floatSqrtFma_fast", .func = floatSqrtFmaFastBenchmark },
+        .{ .name = "floatSqrtFma_jit_compliant", .func = floatSqrtFmaJitCompliantBenchmark },
+        .{ .name = "floatSqrtFma_jit_fast", .func = floatSqrtFmaJitFastBenchmark },
     };
 
     var runner: Runner = .init();
@@ -352,15 +360,23 @@ fn foobar(allocator: std.mem.Allocator) void {
 
 const fibbonacciCompliantBenchmark = MakeBenchmark("fibbonacci.bin", .compliant);
 const fibbonacciFastBenchmark = MakeBenchmark("fibbonacci.bin", .fast);
+const fibbonacciJitCompliantBenchmark = MakeBenchmarkJit("fibbonacci.bin", .compliant);
+const fibbonacciJitFastBenchmark = MakeBenchmarkJit("fibbonacci.bin", .fast);
 
 const floatMinMaxAbsCompliantBenchmark = MakeBenchmark("float_minmax_abs.bin", .compliant);
 const floatMinMaxAbsFastBenchmark = MakeBenchmark("float_minmax_abs.bin", .fast);
+const floatMinMaxAbsJitCompliantBenchmark = MakeBenchmarkJit("float_minmax_abs.bin", .compliant);
+const floatMinMaxAbsJitFastBenchmark = MakeBenchmarkJit("float_minmax_abs.bin", .fast);
 
 const floatArithmeticCompliantBenchmark = MakeBenchmark("float_arithmetic.bin", .compliant);
 const floatArithmeticFastBenchmark = MakeBenchmark("float_arithmetic.bin", .fast);
+const floatArithmeticJitCompliantBenchmark = MakeBenchmarkJit("float_arithmetic.bin", .compliant);
+const floatArithmeticJitFastBenchmark = MakeBenchmarkJit("float_arithmetic.bin", .fast);
 
 const floatSqrtFmaCompliantBenchmark = MakeBenchmark("float_sqrt_fma.bin", .compliant);
 const floatSqrtFmaFastBenchmark = MakeBenchmark("float_sqrt_fma.bin", .fast);
+const floatSqrtFmaJitCompliantBenchmark = MakeBenchmarkJit("float_sqrt_fma.bin", .compliant);
+const floatSqrtFmaJitFastBenchmark = MakeBenchmarkJit("float_sqrt_fma.bin", .fast);
 
 fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Config.Runtime) Benchmark.Func {
     return struct {
@@ -418,6 +434,134 @@ fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Conf
                     .ok => continue,
                     .trap => |i| {
                         std.debug.print("unexpected trap: {any}\n", .{i.cause});
+
+                        return false;
+                    },
+                    .halt => {
+                        if (state.over) {
+                            return true;
+                        }
+
+                        std.debug.print("unexpected halt\n", .{});
+
+                        return false;
+                    },
+                }
+            }
+
+            return true;
+        }
+    }.func;
+}
+
+fn MakeBenchmarkJit(comptime program: []const u8, comptime config: ondatra.jit.EngineConfig.Runtime) Benchmark.Func {
+    return struct {
+        fn func(allocator: std.mem.Allocator, r: *Runner) bool {
+            const PROGRAM = @embedFile(program);
+
+            const State = struct {
+                const Self = @This();
+
+                const Cpu = ondatra.jit.Cpu(.{
+                    .hooks = .{
+                        .ecall = ecall,
+                    },
+                    .runtime = config,
+                });
+
+                over: bool = false,
+                cpu: Cpu,
+
+                fn ecall(ctx: *anyopaque, cause: ondatra.arch.Registers.Mcause.Exception) callconv(.c) ondatra.jit.EngineConfig.Hooks.Action {
+                    _ = cause;
+
+                    const this: *Cpu = @ptrCast(@alignCast(ctx));
+                    const state: *Self = @fieldParentPtr("cpu", this);
+
+                    state.over = true;
+
+                    return .halt;
+                }
+
+                pub fn deinit(this: *Self) void {
+                    this.cpu.deinit();
+                }
+            };
+
+            var ram = std.mem.zeroes([RAM_SIZE]u8);
+            var state: State = .{
+                .cpu = State.Cpu.init(allocator, &ram) catch |err| {
+                    std.debug.print("failed to initialize the CPU: {t}\n", .{err});
+
+                    return false;
+                },
+            };
+            defer state.deinit();
+
+            state.cpu.registers.mstatus.fs = 0b01;
+            _ = state.cpu.loadElf(allocator, PROGRAM) catch |err| {
+                std.debug.print("failed to load the program: {t}\n", .{err});
+
+                return false;
+            };
+
+            var ram_copy = std.mem.zeroes([RAM_SIZE]u8);
+            @memcpy(&ram_copy, &ram);
+
+            std.mem.doNotOptimizeAway(&state);
+            std.mem.doNotOptimizeAway(&state.cpu);
+            std.mem.doNotOptimizeAway(&ram);
+
+            const registers = state.cpu.registers;
+
+            pre_jit: while (!state.over) {
+                const run_state = state.cpu.run(std.math.maxInt(u64)) catch |err| {
+                    std.debug.print("failed to step the CPU: {t}\n", .{err});
+
+                    return false;
+                };
+
+                std.mem.doNotOptimizeAway(&run_state);
+
+                switch (run_state) {
+                    .ok => continue,
+                    .trap => {
+                        std.debug.print("unexpected trap\n", .{});
+
+                        return false;
+                    },
+                    .halt => {
+                        if (state.over) {
+                            break :pre_jit;
+                        }
+
+                        std.debug.print("unexpected halt\n", .{});
+
+                        return false;
+                    },
+                }
+            }
+
+            state.cpu.registers = registers;
+            state.over = false;
+            @memcpy(&ram, &ram_copy);
+
+            r.begin() catch unreachable;
+            defer r.end(state.cpu.registers.instret) catch unreachable;
+
+            while (!state.over) {
+                const run_state = state.cpu.run(std.math.maxInt(u64)) catch |err| {
+                    std.debug.print("failed to step the CPU: {t}\n", .{err});
+
+                    return false;
+                };
+
+                std.mem.doNotOptimizeAway(&run_state);
+
+                switch (run_state) {
+                    .ok => continue,
+                    .trap => {
+                        std.debug.print("unexpected trap\n", .{});
 
                         return false;
                     },
