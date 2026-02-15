@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Igor Spichkin
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const ondatra = @import("ondatra");
 
@@ -11,13 +14,13 @@ var STDERR_BUFFER: [std.math.pow(usize, 2, 20)]u8 = undefined;
 const Host = struct {
     const Cpu = ondatra.cpu.Cpu(.{
         .hooks = .{
-            .isMmio = isMmio,
-            .readTranslate = readTranslate,
-            .writeTranslate = readTranslate,
             .ecall = ecall,
         },
         .compile = .fast_execution,
         .runtime = .compliant,
+        .vars = .{
+            .ram_start = RAM_START,
+        },
     });
 
     cpu: Cpu,
@@ -83,24 +86,6 @@ const Host = struct {
             },
         }
     }
-
-    inline fn isMmio(ctx: *anyopaque, address: u32) bool {
-        _ = ctx;
-
-        return address < RAM_START;
-    }
-
-    inline fn readTranslate(ctx: *anyopaque, address: u32) u32 {
-        _ = ctx;
-
-        return address -% RAM_START;
-    }
-
-    inline fn writeTranslate(ctx: *anyopaque, address: u32) u32 {
-        _ = ctx;
-
-        return address -% RAM_START;
-    }
 };
 
 pub fn main() !void {
@@ -112,7 +97,7 @@ pub fn main() !void {
     var host: Host = try .init(alloc.allocator());
     defer host.deinit(alloc.allocator());
 
-    _ = try host.cpu.loadElf(alloc.allocator(), COREMARK_GUEST, RAM_START);
+    _ = try host.cpu.loadElf(alloc.allocator(), COREMARK_GUEST);
 
     const start_time = std.time.nanoTimestamp();
     host.start_timestamp = start_time;

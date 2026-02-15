@@ -17,13 +17,9 @@ pub const Config = struct {
 
         ecall: ?*const fn (cpu: *anyopaque, cause: arch.Registers.Mcause.Exception) callconv(.@"inline") Action = null,
         ebreak: ?*const fn (cpu: *anyopaque) callconv(.@"inline") Action = null,
-        /// Return true to continue, false to halt.
-        wfi: ?*const fn (cpu: *anyopaque) callconv(.@"inline") bool = null,
-        isMmio: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") bool = null,
         read: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") ?u8 = null,
         write: ?*const fn (cpu: *anyopaque, address: u32, value: u8) callconv(.@"inline") bool = null,
-        readTranslate: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") u32 = null,
-        writeTranslate: ?*const fn (cpu: *anyopaque, address: u32) callconv(.@"inline") u32 = null,
+        instruction_cost: ?*const fn (instruction: arch.Instruction) callconv(.@"inline") usize = null,
     };
 
     pub const Compile = struct {
@@ -40,38 +36,29 @@ pub const Config = struct {
         pub const Extensions = struct {
             m: bool = true,
             f: bool = true,
-            d: bool = true,
             zba: bool = true,
             zbb: bool = true,
             zicsr: bool = true,
             zicntr: bool = true,
         };
 
+        pub const CsrWriteAccess = struct {
+            counters: bool = true,
+        };
+
         /// Enable Physical Memory Protection checks.
-        /// Disable for ~2-3x speedup when running trusted code.
+        /// Disable for ~2-3x speedup.
         enable_pmp: bool = true,
 
-        /// If disabled - enables Physical Memory Protection checks in M mode only when
-        /// MPRV is set.
+        /// If disabled - disables Physical Memory Protection checks in M mode.
         enable_pmp_m: bool = true,
 
         /// Enable memory alignment checks for loads/stores.
         /// RISC-V spec requires this, disable only for known-aligned code.
         enable_memory_alignment: bool = true,
 
-        /// Enable privilege level enforcement.
-        /// When disabled, all code runs in effective_privilege mode.
-        enable_privilege: bool = true,
-
         /// Enable CSR privilege and read-only checks.
         enable_csr_checks: bool = true,
-
-        /// Privilege level when enable_privilege=false
-        effective_privilege: arch.PrivilegeLevel = .machine,
-
-        /// Enable interrupt checking each step.
-        /// Disable if using polling-based interrupt model.
-        enable_interrupts: bool = true,
 
         /// Enable branch/jump target alignment checks (4-byte for RV32I).
         enable_branch_alignment: bool = true,
@@ -80,21 +67,22 @@ pub const Config = struct {
         /// When disabled, FCSR flags are not updated.
         enable_fpu_flags: bool = true,
 
+        /// Enable/disable the specified extensions.
         extensions: Extensions = .{},
 
-        timer_ticks_per_step: u64 = 1,
+        csr_write_access: CsrWriteAccess = .{},
+
+        /// When disabled, stops the execution at any trap instead of
+        /// executing a handler at mtvec.
+        handle_traps: bool = true,
 
         /// Maximum performance, minimal checks (for trusted code)
         pub const fast = Runtime{
             .enable_pmp = false,
             .enable_memory_alignment = false,
-            .enable_privilege = false,
             .enable_csr_checks = false,
-            .enable_interrupts = false,
             .enable_branch_alignment = false,
             .enable_fpu_flags = false,
-            .enable_counters = false,
-            .timer_ticks_per_step = 0,
         };
 
         /// Full spec compliance (default)
@@ -105,16 +93,17 @@ pub const Config = struct {
             .enable_fpu = false,
             .enable_fpu_flags = false,
         };
+    };
 
-        /// User-mode sandbox (full protection, no M-mode features)
-        pub const sandbox = Runtime{
-            .effective_privilege = .user,
-        };
+    pub const Vars = struct {
+        timer_ticks_per_step: u64 = 1,
+        ram_start: u32 = 0,
     };
 
     hooks: Hooks = .{},
     compile: Compile = .fast_execution,
     runtime: Runtime = .compliant,
+    vars: Vars = .{},
 };
 
 pub inline fn Cpu(comptime config: Config) type {
@@ -171,28 +160,37 @@ pub inline fn Cpu(comptime config: Config) type {
         pub inline fn step(this: *Self) State {
             @setEvalBranchQuota(std.math.maxInt(u32));
 
-            if (comptime config.runtime.timer_ticks_per_step > 0) {
-                this.registers.updateTimer(config.runtime.timer_ticks_per_step);
+            if (comptime config.vars.timer_ticks_per_step > 0) {
+                this.registers.updateTimer(config.vars.timer_ticks_per_step);
             }
 
-            if (comptime config.runtime.enable_interrupts) {
-                if (this.checkInterrupts()) |int_cause| {
-                    this.handleTrap(.{ .interrupt = int_cause }, 0);
-                    this.incCounters(false);
+            if (this.checkInterrupts()) |int_cause| {
+                this.handleTrap(.{ .interrupt = int_cause }, 0);
+                this.incCounters(1, false);
 
-                    return .ok;
-                }
+                return .ok;
             }
 
             const instr = this.fetch() catch |err| {
                 return this.fetchErrorToState(err);
             };
 
-            if (comptime config.compile.inline_execute) {
-                return @call(.always_inline, execute, .{ this, instr });
-            } else {
-                return @call(.never_inline, execute, .{ this, instr });
+            const state = if (comptime config.compile.inline_execute)
+                @call(.always_inline, execute, .{ this, instr })
+            else
+                @call(.never_inline, execute, .{ this, instr });
+
+            if (state == .trap) {
+                this.handleTrap(state.trap.cause, state.trap.tval);
+
+                if (this.canHandleTrap()) {
+                    return .ok;
+                }
+
+                return state;
             }
+
+            return state;
         }
 
         pub inline fn run(this: *Self, times: usize) State {
@@ -209,12 +207,28 @@ pub inline fn Cpu(comptime config: Config) type {
             return .ok;
         }
 
-        pub inline fn getPrivilege(this: *Self) arch.PrivilegeLevel {
-            if (comptime config.runtime.enable_privilege) {
-                return this.registers.privilege.sanitize();
-            } else {
-                return config.runtime.effective_privilege;
+        pub inline fn runCycles(this: *Self, cycles: u64) State {
+            @setEvalBranchQuota(std.math.maxInt(u32));
+
+            var left = cycles;
+
+            while (left > 0) {
+                const before = this.registers.cycle;
+                const state = this.step();
+
+                if (state != .ok) {
+                    return state;
+                }
+
+                const dif = this.registers.cycle - before;
+                left -|= dif;
             }
+
+            return .ok;
+        }
+
+        pub inline fn getPrivilege(this: *Self) arch.PrivilegeLevel {
+            return this.registers.privilege.sanitize();
         }
 
         pub inline fn checkFpuAccess(this: *Self) ?State {
@@ -252,7 +266,7 @@ pub inline fn Cpu(comptime config: Config) type {
             return .{ .trap = .{ .cause = .{ .exception = exception }, .tval = tval } };
         }
 
-        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8, offset: u32) ElfLoadError!usize {
+        pub inline fn loadElf(this: *Self, allocator: std.mem.Allocator, content: []const u8) ElfLoadError!usize {
             var file = try elf.File.parseFromSlice(allocator, content);
             defer file.deinit(allocator);
 
@@ -284,7 +298,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     continue;
                 }
 
-                const vaddr = header.vaddr -% offset;
+                const vaddr = header.vaddr -% config.vars.ram_start;
 
                 if (vaddr >= this.ram.len) {
                     return ElfLoadError.OutOfRam;
@@ -324,40 +338,43 @@ pub inline fn Cpu(comptime config: Config) type {
 
             const byte_len = @sizeOf(T);
 
-            if (this.needsPmpCheck(access)) {
-                if (!this.registers.checkPmpAccess(address, byte_len, access, this.getPrivilege())) {
-                    return MemoryError.PmpViolation;
-                }
-            }
-
             if (comptime config.runtime.enable_memory_alignment) {
                 if (address % byte_len != 0) {
                     return MemoryError.MisalignedAddress;
                 }
             }
 
-            if (comptime config.hooks.isMmio != null and config.hooks.read != null) {
-                if (config.hooks.isMmio.?(this, address)) {
+            if (this.needsPmpCheck(access)) {
+                if (!this.registers.checkPmpAccess(address, byte_len, access, this.getPrivilege())) {
+                    return MemoryError.PmpViolation;
+                }
+            }
+
+            if (address < config.vars.ram_start) {
+                if (address +% byte_len > config.vars.ram_start) {
+                    return MemoryError.MisalignedAddress;
+                }
+
+                if (comptime config.hooks.read != null) {
                     var dst: [byte_len]u8 = undefined;
 
                     inline for (0..byte_len) |i| {
-                        if (config.hooks.read.?(this, address +% @as(u32, @intCast(i)))) |value| {
-                            dst[i] = value;
+                        if (config.hooks.read.?(this, address +% @as(u32, @intCast(i)))) |v| {
+                            dst[i] = v;
                         } else {
                             return MemoryError.ReadFailed;
                         }
                     }
 
-                    return std.mem.bytesToValue(T, &dst);
+                    return std.mem.toNative(T, std.mem.bytesToValue(T, &dst), arch.ENDIAN);
                 }
+
+                return MemoryError.AddressOutOfBounds;
             }
 
-            const translated = if (comptime config.hooks.readTranslate) |hook|
-                hook(this, address)
-            else
-                address;
+            const translated: usize = address -| config.vars.ram_start;
 
-            if (@as(u64, translated) + byte_len > this.ram.len) {
+            if (translated + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
             }
 
@@ -372,21 +389,26 @@ pub inline fn Cpu(comptime config: Config) type {
             const T = @TypeOf(value);
             const byte_len = @sizeOf(T);
 
-            if (this.needsPmpCheck(.write)) {
-                if (!this.registers.checkPmpAccess(address, byte_len, .write, this.getPrivilege())) {
-                    return MemoryError.PmpViolation;
-                }
-            }
-
             if (comptime config.runtime.enable_memory_alignment) {
                 if (address % byte_len != 0) {
                     return MemoryError.MisalignedAddress;
                 }
             }
 
-            if (comptime config.hooks.isMmio != null and config.hooks.write != null) {
-                if (config.hooks.isMmio.?(this, address)) {
-                    const src = std.mem.asBytes(&value);
+            if (this.needsPmpCheck(.write)) {
+                if (!this.registers.checkPmpAccess(address, byte_len, .write, this.getPrivilege())) {
+                    return MemoryError.PmpViolation;
+                }
+            }
+
+            if (address < config.vars.ram_start) {
+                if (address +% byte_len > config.vars.ram_start) {
+                    return MemoryError.MisalignedAddress;
+                }
+
+                if (comptime config.hooks.write != null) {
+                    const converted = std.mem.nativeTo(T, value, arch.ENDIAN);
+                    const src = std.mem.asBytes(&converted);
 
                     inline for (0..byte_len) |i| {
                         if (!config.hooks.write.?(this, address +% @as(u32, @intCast(i)), src[i])) {
@@ -396,14 +418,13 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     return;
                 }
+
+                return MemoryError.AddressOutOfBounds;
             }
 
-            const translated = if (comptime config.hooks.writeTranslate) |hook|
-                hook(this, address)
-            else
-                address;
+            const translated: usize = address -| config.vars.ram_start;
 
-            if (@as(u64, translated) + byte_len > this.ram.len) {
+            if (translated + byte_len > this.ram.len) {
                 return MemoryError.AddressOutOfBounds;
             }
 
@@ -439,9 +460,9 @@ pub inline fn Cpu(comptime config: Config) type {
             return arch.Instruction.decode(raw);
         }
 
-        inline fn incCounters(this: *Self, comptime is_retired: bool) void {
+        inline fn incCounters(this: *Self, cycles: u64, comptime is_retired: bool) void {
             if (comptime config.runtime.extensions.zicntr) {
-                this.registers.cycle +%= 1;
+                this.registers.cycle +%= cycles;
 
                 if (is_retired) {
                     this.registers.instret +%= 1;
@@ -493,7 +514,6 @@ pub inline fn Cpu(comptime config: Config) type {
 
         pub inline fn handleTrap(this: *Self, cause: TrapCause, tval: u32) void {
             const mcause = cause.toMcause();
-            const is_interrupt = mcause.interrupt;
 
             this.registers.mepc = this.registers.pc;
             this.registers.mcause = mcause;
@@ -505,7 +525,17 @@ pub inline fn Cpu(comptime config: Config) type {
 
             this.registers.privilege = .machine;
 
-            this.registers.pc = this.registers.mtvec.getAddress(mcause.code, is_interrupt);
+            this.registers.pc = this.registers.mtvec.getAddress(mcause.code, mcause.interrupt);
+        }
+
+        inline fn canHandleTrap(this: *Self) bool {
+            if (comptime !config.runtime.handle_traps) {
+                return false;
+            }
+
+            const base = this.registers.mtvec.base;
+
+            return base >= config.vars.ram_start and base < this.ram.len;
         }
 
         inline fn executeMret(this: *Self) State {
@@ -513,12 +543,16 @@ pub inline fn Cpu(comptime config: Config) type {
                 return trapState(.illegal_instruction, 0);
             }
 
-            this.registers.privilege = this.registers.mstatus.mpp.sanitize();
+            const prev_mpp = this.registers.mstatus.mpp;
 
+            this.registers.privilege = prev_mpp.sanitize();
             this.registers.mstatus.mie = this.registers.mstatus.mpie;
             this.registers.mstatus.mpie = true;
-
             this.registers.mstatus.mpp = .user;
+
+            if (prev_mpp != .machine) {
+                this.registers.mstatus.mprv = false;
+            }
 
             this.registers.pc = this.registers.mepc;
 
@@ -526,10 +560,6 @@ pub inline fn Cpu(comptime config: Config) type {
         }
 
         pub inline fn checkInterrupts(this: *Self) ?arch.Registers.Mcause.Interrupt {
-            if (comptime !config.runtime.enable_interrupts) {
-                return null;
-            }
-
             const priv = this.getPrivilege();
             const can_interrupt = this.registers.mstatus.mie or (priv == .user);
 
@@ -557,7 +587,27 @@ pub inline fn Cpu(comptime config: Config) type {
             return null;
         }
 
+        inline fn readCsr(this: *Self, csr: arch.Registers.Csr) arch.Registers.Csr.Error!u32 {
+            return this.registers.readCsr(csr, this.getPrivilege());
+        }
+
+        inline fn writeCsr(this: *Self, csr: arch.Registers.Csr, value: u32) arch.Registers.Csr.Error!void {
+            if (comptime !config.runtime.csr_write_access.counters) {
+                switch (csr) {
+                    .cycle, .cycleh, .instret, .instreth => return arch.Registers.Csr.Error.IllegalInstruction,
+                    else => {},
+                }
+            }
+
+            try this.registers.writeCsr(csr, value, this.getPrivilege());
+        }
+
         fn execute(this: *Self, instruction: arch.Instruction) State {
+            const cost = if (comptime config.hooks.instruction_cost != null)
+                config.hooks.instruction_cost.?(instruction)
+            else
+                1;
+
             switch (instruction) {
                 .lui => |i| {
                     this.registers.set(i.rd, @as(i32, i.imm) << 12);
@@ -575,7 +625,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     if (comptime config.runtime.enable_branch_alignment) {
                         if (target % 4 != 0) {
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return trapState(.instruction_address_misaligned, target);
                         }
@@ -589,7 +639,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     if (comptime config.runtime.enable_branch_alignment) {
                         if (target % 4 != 0) {
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return trapState(.instruction_address_misaligned, target);
                         }
@@ -605,7 +655,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                         if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return trapState(.instruction_address_misaligned, target);
                             }
@@ -623,7 +673,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                         if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return trapState(.instruction_address_misaligned, target);
                             }
@@ -641,7 +691,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                         if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return trapState(.instruction_address_misaligned, target);
                             }
@@ -659,7 +709,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                         if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return trapState(.instruction_address_misaligned, target);
                             }
@@ -680,7 +730,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                         if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return trapState(.instruction_address_misaligned, target);
                             }
@@ -701,7 +751,7 @@ pub inline fn Cpu(comptime config: Config) type {
 
                         if (comptime config.runtime.enable_branch_alignment) {
                             if (target % 4 != 0) {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return trapState(.instruction_address_misaligned, target);
                             }
@@ -717,7 +767,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
                     const val = this.readMemory(addr, i8, .read) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .load, addr);
                     };
@@ -730,7 +780,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
                     const val = this.readMemory(addr, i16, .read) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .load, addr);
                     };
@@ -743,7 +793,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
                     const val = this.readMemory(addr, i32, .read) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .load, addr);
                     };
@@ -756,7 +806,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
                     const val = this.readMemory(addr, u8, .read) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .load, addr);
                     };
@@ -769,7 +819,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
                     const val = this.readMemory(addr, u16, .read) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .load, addr);
                     };
@@ -784,7 +834,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const val: u8 = @truncate(@as(u32, @bitCast(this.registers.get(i.rs2))));
 
                     this.writeMemory(addr, val) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .store, addr);
                     };
@@ -798,7 +848,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const val: u16 = @truncate(@as(u32, @bitCast(this.registers.get(i.rs2))));
 
                     this.writeMemory(addr, val) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .store, addr);
                     };
@@ -811,7 +861,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const addr = base +% offset;
 
                     this.writeMemory(addr, @as(u32, @bitCast(this.registers.get(i.rs2)))) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .store, addr);
                     };
@@ -930,20 +980,20 @@ pub inline fn Cpu(comptime config: Config) type {
                         switch (hook(@ptrCast(this), cause)) {
                             .proceed => {},
                             .skip => {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
                                 this.registers.pc +%= 4;
 
                                 return .ok;
                             },
                             .halt => {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return .halt;
                             },
                         }
                     }
 
-                    this.incCounters(true);
+                    this.incCounters(cost, true);
 
                     return trapState(cause, 0);
                 },
@@ -952,26 +1002,26 @@ pub inline fn Cpu(comptime config: Config) type {
                         switch (hook(this)) {
                             .proceed => {},
                             .skip => {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
                                 this.registers.pc +%= 4;
 
                                 return .ok;
                             },
                             .halt => {
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return .halt;
                             },
                         }
                     }
 
-                    this.incCounters(true);
+                    this.incCounters(cost, true);
 
-                    return trapState(.breakpoint, this.registers.pc); // breakpoint: mtval = PC
+                    return trapState(.breakpoint, this.registers.pc);
                 },
                 .mul => |i| {
                     if (comptime !config.runtime.extensions.m) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -981,7 +1031,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .mulh => |i| {
                     if (comptime !config.runtime.extensions.m) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -994,7 +1044,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .mulhsu => |i| {
                     if (comptime !config.runtime.extensions.m) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -1008,7 +1058,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .mulhu => |i| {
                     if (comptime !config.runtime.extensions.m) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -1021,7 +1071,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .div => |i| {
                     if (comptime !config.runtime.extensions.m) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -1040,7 +1090,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .divu => |i| {
                     if (comptime !config.runtime.extensions.m) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -1058,7 +1108,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .rem => |i| {
                     if (comptime !config.runtime.extensions.m) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -1078,7 +1128,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .remu => |i| {
                     if (comptime !config.runtime.extensions.m) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -1100,7 +1150,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1109,7 +1159,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const offset: u32 = @bitCast(@as(i32, i.imm));
                     const addr = base +% offset;
                     const val = this.readMemory(addr, u32, .read) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .load, addr);
                     };
@@ -1124,7 +1174,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1135,7 +1185,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const val: u32 = @bitCast(this.registers.getF32(i.rs2));
 
                     this.writeMemory(addr, val) catch |err| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return memoryErrorToState(err, .store, addr);
                     };
@@ -1148,13 +1198,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1175,7 +1225,7 @@ pub inline fn Cpu(comptime config: Config) type {
                                 this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                                 this.markFpuDirty();
                                 this.registers.pc +%= 4;
-                                this.incCounters(true);
+                                this.incCounters(cost, true);
 
                                 return .ok;
                             }
@@ -1213,13 +1263,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1239,7 +1289,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                             this.markFpuDirty();
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -1276,13 +1326,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1302,7 +1352,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                             this.markFpuDirty();
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -1343,13 +1393,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1369,7 +1419,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                             this.markFpuDirty();
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -1410,13 +1460,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1433,7 +1483,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                             this.markFpuDirty();
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -1456,7 +1506,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1497,7 +1547,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1538,7 +1588,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1557,7 +1607,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1576,7 +1626,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1595,7 +1645,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1627,7 +1677,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1640,7 +1690,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.fcsr.nv = true;
                             this.registers.set(i.rd, 0);
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -1655,7 +1705,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1668,7 +1718,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.fcsr.nv = true;
                             this.registers.set(i.rd, 0);
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -1683,13 +1733,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1748,12 +1798,12 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
                         return state;
                     }
 
@@ -1811,13 +1861,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1841,13 +1891,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1871,7 +1921,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1887,7 +1937,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1904,7 +1954,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1940,13 +1990,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -1968,7 +2018,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                             this.markFpuDirty();
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -2010,13 +2060,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -2038,7 +2088,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                             this.markFpuDirty();
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -2078,13 +2128,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -2106,7 +2156,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                             this.markFpuDirty();
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -2146,13 +2196,13 @@ pub inline fn Cpu(comptime config: Config) type {
                     }
 
                     if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
 
                     if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -2174,7 +2224,7 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
                             this.markFpuDirty();
                             this.registers.pc +%= 4;
-                            this.incCounters(true);
+                            this.incCounters(cost, true);
 
                             return .ok;
                         }
@@ -2208,1144 +2258,6 @@ pub inline fn Cpu(comptime config: Config) type {
                     this.markFpuDirty();
                     this.registers.pc +%= 4;
                 },
-                .fld => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const base: u32 = @bitCast(this.registers.get(i.rs1));
-                    const offset: u32 = @bitCast(@as(i32, i.imm));
-                    const addr = base +% offset;
-                    const val = this.readMemory(addr, u64, .read) catch |err| {
-                        this.incCounters(true);
-
-                        return memoryErrorToState(err, .load, addr);
-                    };
-
-                    this.registers.setF64(i.rd, @bitCast(val));
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fsd => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const base: u32 = @bitCast(this.registers.get(i.rs1));
-                    const offset: u32 = @bitCast(@as(i32, i.imm));
-                    const addr = base +% offset;
-
-                    this.writeMemory(addr, @as(u64, @bitCast(this.registers.getF64(i.rs2)))) catch |err| {
-                        this.incCounters(true);
-
-                        return memoryErrorToState(err, .store, addr);
-                    };
-
-                    this.registers.pc +%= 4;
-                },
-                .fadd_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        if (std.math.isInf(rs1) and std.math.isInf(rs2) and (rs1 > 0) != (rs2 > 0)) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    const result = rs1 + rs2;
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (std.math.isInf(result) and !std.math.isInf(rs1) and !std.math.isInf(rs2)) {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
-                        }
-
-                        if (arch.FloatHelpers.isSubnormalF64(result)) {
-                            this.registers.fcsr.uf = true;
-                        }
-                    }
-
-                    this.registers.setF64(i.rd, if (std.math.isNan(result)) arch.FloatHelpers.canonicalNanF64() else result);
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fsub_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or arch.FloatHelpers.isSignalingNanF64(rs2)) {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        // inf - inf with same signs = NaN
-                        if (std.math.isInf(rs1) and std.math.isInf(rs2) and (rs1 > 0) == (rs2 > 0)) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    const result = rs1 - rs2;
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
-                        }
-
-                        if (arch.FloatHelpers.isSubnormalF64(result)) {
-                            this.registers.fcsr.uf = true;
-                        }
-                    }
-
-                    this.registers.setF64(i.rd, if (std.math.isNan(result)) arch.FloatHelpers.canonicalNanF64() else result);
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fmul_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        // 0 * inf = NaN
-                        if ((rs1 == 0 and std.math.isInf(rs2)) or (std.math.isInf(rs1) and rs2 == 0)) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    const result = rs1 * rs2;
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (std.math.isInf(result) and
-                            !std.math.isInf(rs1) and
-                            !std.math.isInf(rs2))
-                        {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
-                        }
-
-                        if (arch.FloatHelpers.isSubnormalF64(result)) {
-                            this.registers.fcsr.uf = true;
-                        }
-                    }
-
-                    this.registers.setF64(i.rd, if (std.math.isNan(result)) arch.FloatHelpers.canonicalNanF64() else result);
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fdiv_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        // 0/0 or inf/inf = NaN
-                        if ((rs1 == 0 and rs2 == 0) or
-                            (std.math.isInf(rs1) and std.math.isInf(rs2)))
-                        {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-
-                        // x/0 (x != 0, x != NaN) = ±inf, sets DZ
-                        if (rs2 == 0 and rs1 != 0 and !std.math.isNan(rs1)) {
-                            this.registers.fcsr.dz = true;
-                        }
-                    }
-
-                    const result = rs1 / rs2;
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (std.math.isInf(result) and !std.math.isInf(rs1) and rs2 != 0) {
-                            this.registers.fcsr.of = true;
-                            this.registers.fcsr.nx = true;
-                        }
-
-                        if (arch.FloatHelpers.isSubnormalF64(result)) {
-                            this.registers.fcsr.uf = true;
-                        }
-                    }
-
-                    this.registers.setF64(i.rd, if (std.math.isNan(result)) arch.FloatHelpers.canonicalNanF64() else result);
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fsqrt_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1)) {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        // sqrt of negative (except -0) = NaN
-                        if (rs1 < 0 and !arch.FloatHelpers.isNegativeZeroF64(rs1)) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    const result = @sqrt(rs1);
-
-                    // sqrt(-0) = -0
-                    if (arch.FloatHelpers.isNegativeZeroF64(rs1)) {
-                        this.registers.setF64(i.rd, rs1);
-                    } else {
-                        this.registers.setF64(i.rd, if (std.math.isNan(result)) arch.FloatHelpers.canonicalNanF64() else result);
-                    }
-
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fmin_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-                    }
-
-                    const result: f64 = if (std.math.isNan(rs1) and std.math.isNan(rs2))
-                        arch.FloatHelpers.canonicalNanF64()
-                    else if (std.math.isNan(rs1))
-                        rs2
-                    else if (std.math.isNan(rs2))
-                        rs1
-                    else if (rs1 == 0 and rs2 == 0)
-                        // -0.0 < +0.0
-                        if (arch.FloatHelpers.isNegativeZeroF64(rs1) or arch.FloatHelpers.isNegativeZeroF64(rs2))
-                            @bitCast(@as(u64, 0x8000000000000000)) // -0.0
-                        else
-                            rs1
-                    else
-                        @min(rs1, rs2);
-
-                    this.registers.setF64(i.rd, result);
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fmax_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-                    }
-
-                    const result: f64 = if (std.math.isNan(rs1) and std.math.isNan(rs2))
-                        arch.FloatHelpers.canonicalNanF64()
-                    else if (std.math.isNan(rs1))
-                        rs2
-                    else if (std.math.isNan(rs2))
-                        rs1
-                    else if (rs1 == 0 and rs2 == 0)
-                        // +0.0 > -0.0
-                        if (arch.FloatHelpers.isPositiveZeroF64(rs1) or
-                            arch.FloatHelpers.isPositiveZeroF64(rs2))
-                            @as(f64, 0.0) // +0.0
-                        else
-                            rs1
-                    else
-                        @max(rs1, rs2);
-
-                    this.registers.setF64(i.rd, result);
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fsgnj_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1: u64 = @bitCast(this.registers.getF64(i.rs1));
-                    const rs2: u64 = @bitCast(this.registers.getF64(i.rs2));
-                    const result = (rs1 & 0x7FFFFFFFFFFFFFFF) | (rs2 & 0x8000000000000000);
-
-                    this.registers.setF64(i.rd, @bitCast(result));
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fsgnjn_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1: u64 = @bitCast(this.registers.getF64(i.rs1));
-                    const rs2: u64 = @bitCast(this.registers.getF64(i.rs2));
-                    const result = (rs1 & 0x7FFFFFFFFFFFFFFF) | (~rs2 & 0x8000000000000000);
-
-                    this.registers.setF64(i.rd, @bitCast(result));
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fsgnjx_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1: u64 = @bitCast(this.registers.getF64(i.rs1));
-                    const rs2: u64 = @bitCast(this.registers.getF64(i.rs2));
-                    const result = rs1 ^ (rs2 & 0x8000000000000000);
-
-                    this.registers.setF64(i.rd, @bitCast(result));
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .feq_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        // feq: only sNaN sets NV
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-                    }
-
-                    // NaN is never equal to anything (including itself)
-                    const result: i32 = if (std.math.isNan(rs1) or std.math.isNan(rs2))
-                        0
-                    else if (rs1 == rs2)
-                        1
-                    else
-                        0;
-
-                    this.registers.set(i.rd, result);
-                    this.registers.pc +%= 4;
-                },
-                .flt_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        // flt/fle: any NaN sets NV
-                        if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.set(i.rd, 0);
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    this.registers.set(i.rd, if (rs1 < rs2) 1 else 0);
-                    this.registers.pc +%= 4;
-                },
-                .fle_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (std.math.isNan(rs1) or std.math.isNan(rs2)) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.set(i.rd, 0);
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    this.registers.set(i.rd, if (rs1 <= rs2) 1 else 0);
-                    this.registers.pc +%= 4;
-                },
-                .fcvt_w_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rm = this.registers.fcsr.getEffectiveRm(i.rm);
-
-                    var result: i32 = undefined;
-                    var invalid = false;
-
-                    if (std.math.isNan(rs1)) {
-                        result = std.math.maxInt(i32);
-                        invalid = true;
-                    } else if (std.math.isInf(rs1)) {
-                        result = if (rs1 > 0) std.math.maxInt(i32) else std.math.minInt(i32);
-                        invalid = true;
-                    } else {
-                        const rounded: f64 = switch (rm) {
-                            .rne => arch.FloatHelpers.roundToNearestEvenF64(rs1),
-                            .rtz => if (rs1 >= 0) @floor(rs1) else @ceil(rs1),
-                            .rdn => @floor(rs1),
-                            .rup => @ceil(rs1),
-                            .rmm => if (rs1 >= 0) @floor(rs1 + 0.5) else @ceil(rs1 - 0.5),
-                            else => arch.FloatHelpers.roundToNearestEvenF64(rs1),
-                        };
-
-                        if (rounded > @as(f64, @floatFromInt(std.math.maxInt(i32)))) {
-                            result = std.math.maxInt(i32);
-                            invalid = true;
-                        } else if (rounded < @as(f64, @floatFromInt(std.math.minInt(i32)))) {
-                            result = std.math.minInt(i32);
-                            invalid = true;
-                        } else {
-                            result = @intFromFloat(rounded);
-
-                            if (comptime config.runtime.enable_fpu_flags) {
-                                if (rounded != rs1) {
-                                    this.registers.fcsr.nx = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (invalid) {
-                            this.registers.fcsr.nv = true;
-                        }
-                    }
-
-                    this.registers.set(i.rd, result);
-                    this.registers.pc +%= 4;
-                },
-                .fcvt_wu_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rm = this.registers.fcsr.getEffectiveRm(i.rm);
-
-                    var result: u32 = undefined;
-                    var invalid = false;
-
-                    if (std.math.isNan(rs1)) {
-                        result = std.math.maxInt(u32);
-                        invalid = true;
-                    } else if (std.math.isInf(rs1)) {
-                        result = if (rs1 > 0) std.math.maxInt(u32) else 0;
-                        invalid = true;
-                    } else {
-                        const rounded: f64 = switch (rm) {
-                            .rne => arch.FloatHelpers.roundToNearestEvenF64(rs1),
-                            .rtz => if (rs1 >= 0) @floor(rs1) else @ceil(rs1),
-                            .rdn => @floor(rs1),
-                            .rup => @ceil(rs1),
-                            .rmm => if (rs1 >= 0) @floor(rs1 + 0.5) else @ceil(rs1 - 0.5),
-                            else => arch.FloatHelpers.roundToNearestEvenF64(rs1),
-                        };
-
-                        if (rounded < 0) {
-                            result = 0;
-                            invalid = true;
-                        } else if (rounded > @as(f64, @floatFromInt(std.math.maxInt(u32)))) {
-                            result = std.math.maxInt(u32);
-                            invalid = true;
-                        } else {
-                            result = @intFromFloat(rounded);
-
-                            if (comptime config.runtime.enable_fpu_flags) {
-                                if (rounded != rs1) {
-                                    this.registers.fcsr.nx = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (invalid) {
-                            this.registers.fcsr.nv = true;
-                        }
-                    }
-
-                    this.registers.set(i.rd, @bitCast(result));
-                    this.registers.pc +%= 4;
-                },
-                .fcvt_d_w => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.get(i.rs1);
-                    // i32 -> f64 is always exact
-                    const result: f64 = @floatFromInt(rs1);
-
-                    this.registers.setF64(i.rd, result);
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fcvt_d_wu => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1: u32 = @bitCast(this.registers.get(i.rs1));
-                    // u32 -> f64 is always exact
-                    const result: f64 = @floatFromInt(rs1);
-
-                    this.registers.setF64(i.rd, result);
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fclass_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const val = this.registers.getF64(i.rs1);
-                    const bits: u64 = @bitCast(val);
-                    const sign = (bits >> 63) & 1;
-                    const exp = (bits >> 52) & 0x7FF;
-                    const frac = bits & 0xFFFFFFFFFFFFF;
-
-                    const result: u32 = if (exp == 0x7FF and frac != 0)
-                        // NaN
-                        if (frac & 0x8000000000000 != 0) 0x200 else 0x100 // qNaN (bit 9) or sNaN (bit 8)
-                    else if (exp == 0x7FF)
-                        // Infinity
-                        if (sign != 0) 0x001 else 0x080 // -inf (bit 0) or +inf (bit 7)
-                    else if (exp == 0 and frac == 0)
-                        // Zero
-                        if (sign != 0) 0x008 else 0x010 // -0 (bit 3) or +0 (bit 4)
-                    else if (exp == 0)
-                        // Subnormal
-                        if (sign != 0) 0x004 else 0x020 // negative (bit 2) or positive (bit 5)
-                    else
-                        // Normal
-                        if (sign != 0) 0x002 else 0x040; // negative (bit 1) or positive (bit 6)
-
-                    this.registers.set(i.rd, @bitCast(result));
-                    this.registers.pc +%= 4;
-                },
-                .fmadd_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-                    const rs3 = this.registers.getF64(i.rs3);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2) or
-                            arch.FloatHelpers.isSignalingNanF64(rs3))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        // inf * 0 or 0 * inf
-                        if ((std.math.isInf(rs1) and rs2 == 0) or
-                            (rs1 == 0 and std.math.isInf(rs2)))
-                        {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    const result = @mulAdd(f64, rs1, rs2, rs3);
-
-                    if (std.math.isNan(result)) {
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                                this.registers.fcsr.nv = true;
-                            }
-                        }
-
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                    } else {
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (std.math.isInf(result) and
-                                !std.math.isInf(rs1) and
-                                !std.math.isInf(rs2) and
-                                !std.math.isInf(rs3))
-                            {
-                                this.registers.fcsr.of = true;
-                                this.registers.fcsr.nx = true;
-                            }
-                        }
-
-                        this.registers.setF64(i.rd, result);
-                    }
-
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fmsub_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-                    const rs3 = this.registers.getF64(i.rs3);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2) or
-                            arch.FloatHelpers.isSignalingNanF64(rs3))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    const result = @mulAdd(f64, rs1, rs2, -rs3);
-
-                    if (std.math.isNan(result)) {
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                                this.registers.fcsr.nv = true;
-                            }
-                        }
-
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                    } else {
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (std.math.isInf(result) and
-                                !std.math.isInf(rs1) and
-                                !std.math.isInf(rs2) and
-                                !std.math.isInf(rs3))
-                            {
-                                this.registers.fcsr.of = true;
-                                this.registers.fcsr.nx = true;
-                            }
-                        }
-
-                        this.registers.setF64(i.rd, result);
-                    }
-
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fnmsub_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-                    const rs3 = this.registers.getF64(i.rs3);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2) or
-                            arch.FloatHelpers.isSignalingNanF64(rs3))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    const result = @mulAdd(f64, -rs1, rs2, rs3);
-
-                    if (std.math.isNan(result)) {
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                                this.registers.fcsr.nv = true;
-                            }
-                        }
-
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                    } else {
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (std.math.isInf(result) and
-                                !std.math.isInf(rs1) and
-                                !std.math.isInf(rs2) and
-                                !std.math.isInf(rs3))
-                            {
-                                this.registers.fcsr.of = true;
-                                this.registers.fcsr.nx = true;
-                            }
-                        }
-
-                        this.registers.setF64(i.rd, result);
-                    }
-
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fnmadd_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-                    const rs2 = this.registers.getF64(i.rs2);
-                    const rs3 = this.registers.getF64(i.rs3);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1) or
-                            arch.FloatHelpers.isSignalingNanF64(rs2) or
-                            arch.FloatHelpers.isSignalingNanF64(rs3))
-                        {
-                            this.registers.fcsr.nv = true;
-                        }
-
-                        if ((std.math.isInf(rs1) and rs2 == 0) or (rs1 == 0 and std.math.isInf(rs2))) {
-                            this.registers.fcsr.nv = true;
-                            this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                            this.markFpuDirty();
-                            this.registers.pc +%= 4;
-                            this.incCounters(true);
-
-                            return .ok;
-                        }
-                    }
-
-                    const result = @mulAdd(f64, -rs1, rs2, -rs3);
-
-                    if (std.math.isNan(result)) {
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (!std.math.isNan(rs1) and !std.math.isNan(rs2) and !std.math.isNan(rs3)) {
-                                this.registers.fcsr.nv = true;
-                            }
-                        }
-
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                    } else {
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (std.math.isInf(result) and
-                                !std.math.isInf(rs1) and
-                                !std.math.isInf(rs2) and
-                                !std.math.isInf(rs3))
-                            {
-                                this.registers.fcsr.of = true;
-                                this.registers.fcsr.nx = true;
-                            }
-                        }
-
-                        this.registers.setF64(i.rd, result);
-                    }
-
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fcvt_s_d => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF64(i.rs1);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF64(rs1)) {
-                            this.registers.fcsr.nv = true;
-                        }
-                    }
-
-                    if (std.math.isNan(rs1)) {
-                        this.registers.setF32(i.rd, arch.FloatHelpers.canonicalNanF32());
-                    } else {
-                        const result: f32 = @floatCast(rs1);
-
-                        if (comptime config.runtime.enable_fpu_flags) {
-                            if (std.math.isInf(result) and
-                                !std.math.isInf(rs1))
-                            {
-                                this.registers.fcsr.of = true;
-                                this.registers.fcsr.nx = true;
-                            }
-
-                            if (arch.FloatHelpers.isSubnormalF32(result)) {
-                                this.registers.fcsr.uf = true;
-                            }
-
-                            if (@as(f64, result) != rs1) {
-                                this.registers.fcsr.nx = true;
-                            }
-                        }
-
-                        this.registers.setF32(i.rd, result);
-                    }
-
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
-                .fcvt_d_s => |i| {
-                    if (comptime !config.runtime.extensions.d) {
-                        return trapState(.illegal_instruction, 0);
-                    }
-
-                    if (this.checkFpuAccess()) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    if (this.checkRoundingMode(i.rm)) |state| {
-                        this.incCounters(true);
-
-                        return state;
-                    }
-
-                    const rs1 = this.registers.getF32(i.rs1);
-
-                    if (comptime config.runtime.enable_fpu_flags) {
-                        if (arch.FloatHelpers.isSignalingNanF32(rs1)) {
-                            this.registers.fcsr.nv = true;
-                        }
-                    }
-
-                    if (std.math.isNan(rs1)) {
-                        this.registers.setF64(i.rd, arch.FloatHelpers.canonicalNanF64());
-                    } else {
-                        this.registers.setF64(i.rd, @as(f64, rs1));
-                    }
-
-                    this.markFpuDirty();
-                    this.registers.pc +%= 4;
-                },
                 .csrrw => |i| {
                     if (comptime !config.runtime.extensions.zicsr) {
                         return trapState(.illegal_instruction, 0);
@@ -3356,8 +2268,8 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     if (comptime config.runtime.enable_csr_checks) {
                         if (i.rd != 0) {
-                            const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
-                                this.incCounters(true);
+                            const old = this.readCsr(csr) catch {
+                                this.incCounters(cost, true);
 
                                 return trapState(.illegal_instruction, 0);
                             };
@@ -3365,8 +2277,8 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.set(i.rd, @bitCast(old));
                         }
 
-                        this.registers.writeCsr(csr, rs1_val, this.getPrivilege()) catch {
-                            this.incCounters(true);
+                        this.writeCsr(csr, rs1_val) catch {
+                            this.incCounters(cost, true);
 
                             return trapState(.illegal_instruction, 0);
                         };
@@ -3390,8 +2302,8 @@ pub inline fn Cpu(comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
-                        const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
-                            this.incCounters(true);
+                        const old = this.readCsr(csr) catch {
+                            this.incCounters(cost, true);
 
                             return trapState(.illegal_instruction, 0);
                         };
@@ -3401,8 +2313,8 @@ pub inline fn Cpu(comptime config: Config) type {
                         if (i.rs1 != 0) {
                             const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
 
-                            this.registers.writeCsr(csr, old | rs1_val, this.getPrivilege()) catch {
-                                this.incCounters(true);
+                            this.writeCsr(csr, old | rs1_val) catch {
+                                this.incCounters(cost, true);
 
                                 return trapState(.illegal_instruction, 0);
                             };
@@ -3429,8 +2341,8 @@ pub inline fn Cpu(comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
-                        const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
-                            this.incCounters(true);
+                        const old = this.readCsr(csr) catch {
+                            this.incCounters(cost, true);
 
                             return trapState(.illegal_instruction, 0);
                         };
@@ -3440,8 +2352,8 @@ pub inline fn Cpu(comptime config: Config) type {
                         if (i.rs1 != 0) {
                             const rs1_val: u32 = @bitCast(this.registers.get(i.rs1));
 
-                            this.registers.writeCsr(csr, old & ~rs1_val, this.getPrivilege()) catch {
-                                this.incCounters(true);
+                            this.writeCsr(csr, old & ~rs1_val) catch {
+                                this.incCounters(cost, true);
 
                                 return trapState(.illegal_instruction, 0);
                             };
@@ -3469,8 +2381,8 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     if (comptime config.runtime.enable_csr_checks) {
                         if (i.rd != 0) {
-                            const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
-                                this.incCounters(true);
+                            const old = this.readCsr(csr) catch {
+                                this.incCounters(cost, true);
 
                                 return trapState(.illegal_instruction, 0);
                             };
@@ -3478,8 +2390,8 @@ pub inline fn Cpu(comptime config: Config) type {
                             this.registers.set(i.rd, @bitCast(old));
                         }
 
-                        this.registers.writeCsr(csr, @as(u32, i.uimm), this.getPrivilege()) catch {
-                            this.incCounters(true);
+                        this.writeCsr(csr, @as(u32, i.uimm)) catch {
+                            this.incCounters(cost, true);
 
                             return trapState(.illegal_instruction, 0);
                         };
@@ -3503,8 +2415,8 @@ pub inline fn Cpu(comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
-                        const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
-                            this.incCounters(true);
+                        const old = this.readCsr(csr) catch {
+                            this.incCounters(cost, true);
 
                             return trapState(.illegal_instruction, 0);
                         };
@@ -3512,8 +2424,8 @@ pub inline fn Cpu(comptime config: Config) type {
                         this.registers.set(i.rd, @bitCast(old));
 
                         if (i.uimm != 0) {
-                            this.registers.writeCsr(csr, old | @as(u32, i.uimm), this.getPrivilege()) catch {
-                                this.incCounters(true);
+                            this.writeCsr(csr, old | @as(u32, i.uimm)) catch {
+                                this.incCounters(cost, true);
 
                                 return trapState(.illegal_instruction, 0);
                             };
@@ -3538,8 +2450,8 @@ pub inline fn Cpu(comptime config: Config) type {
                     const csr: arch.Registers.Csr = @enumFromInt(i.csr);
 
                     if (comptime config.runtime.enable_csr_checks) {
-                        const old = this.registers.readCsr(csr, this.getPrivilege()) catch {
-                            this.incCounters(true);
+                        const old = this.readCsr(csr) catch {
+                            this.incCounters(cost, true);
 
                             return trapState(.illegal_instruction, 0);
                         };
@@ -3547,8 +2459,8 @@ pub inline fn Cpu(comptime config: Config) type {
                         this.registers.set(i.rd, @bitCast(old));
 
                         if (i.uimm != 0) {
-                            this.registers.writeCsr(csr, old & ~@as(u32, i.uimm), this.getPrivilege()) catch {
-                                this.incCounters(true);
+                            this.writeCsr(csr, old & ~@as(u32, i.uimm)) catch {
+                                this.incCounters(cost, true);
 
                                 return trapState(.illegal_instruction, 0);
                             };
@@ -3570,7 +2482,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .sh1add => |i| {
                     if (comptime !config.runtime.extensions.zba) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3583,7 +2495,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .sh2add => |i| {
                     if (comptime !config.runtime.extensions.zba) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3596,7 +2508,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .sh3add => |i| {
                     if (comptime !config.runtime.extensions.zba) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3609,7 +2521,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .andn => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3622,7 +2534,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .orn => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3635,7 +2547,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .xnor => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3648,7 +2560,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .clz => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3660,7 +2572,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .ctz => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3672,7 +2584,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .cpop => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3684,7 +2596,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .max => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3697,7 +2609,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .maxu => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3710,7 +2622,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .min => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3723,7 +2635,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .minu => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3736,7 +2648,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .sext_b => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3749,7 +2661,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .sext_h => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3762,7 +2674,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .zext_h => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3774,7 +2686,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .rol => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3787,7 +2699,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .ror => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3800,7 +2712,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .rori => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3812,7 +2724,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .orc_b => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3833,7 +2745,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 },
                 .rev8 => |i| {
                     if (comptime !config.runtime.extensions.zbb) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3847,7 +2759,7 @@ pub inline fn Cpu(comptime config: Config) type {
                     const state = this.executeMret();
 
                     if (state != .ok) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return state;
                     }
@@ -3855,7 +2767,7 @@ pub inline fn Cpu(comptime config: Config) type {
                 .wfi => {
                     // WFI in U-mode with TW=1 causes illegal instruction
                     if (this.getPrivilege() == .user and this.registers.mstatus.tw) {
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
 
                         return trapState(.illegal_instruction, 0);
                     }
@@ -3868,28 +2780,19 @@ pub inline fn Cpu(comptime config: Config) type {
 
                     if (pending != 0) {
                         // Enabled interrupt is pending - resume execution
-                        this.incCounters(true);
+                        this.incCounters(cost, true);
                         this.registers.pc +%= 4;
 
                         return .ok;
                     }
 
-                    if (comptime config.hooks.wfi) |hook| {
-                        if (hook(this)) {
-                            this.incCounters(true);
-                            this.registers.pc +%= 4;
-
-                            return .ok;
-                        }
-                    }
-
-                    this.incCounters(false);
+                    this.incCounters(cost, false);
 
                     return .halt;
                 },
             }
 
-            this.incCounters(true);
+            this.incCounters(cost, true);
 
             return .ok;
         }
@@ -3907,7 +2810,7 @@ fn initRamWithCode(ram_size: comptime_int, code: []const arch.Instruction) [ram_
     return ram;
 }
 
-fn configurePmpFullAccess(cpu: *TestCpu) void {
+fn configurePmpFullAccess(cpu: anytype) void {
     // NAPOT covering entire 32-bit address space (4GB)
     // pmpaddr with 29 trailing 1s gives size = 8 << 29 = 4GB
     cpu.registers.pmpaddr[0] = 0x1FFFFFFF;
@@ -3919,7 +2822,17 @@ fn configurePmpFullAccess(cpu: *TestCpu) void {
     }));
 }
 
-const TestCpu = Cpu(.{ .runtime = .compliant, .compile = .fast_compile });
+const TestCpu = Cpu(.{
+    .runtime = .{
+        .handle_traps = false,
+    },
+    .compile = .fast_compile,
+});
+
+const TrapsTestCpu = Cpu(.{
+    .runtime = .compliant,
+    .compile = .fast_compile,
+});
 
 test "x0 register is always zero" {
     var ram = initRamWithCode(1024, &.{
@@ -5551,529 +4464,6 @@ test "fnmadd_s - negated fused multiply-add" {
     try std.testing.expectEqual(@as(f32, -7.0), cpu.registers.getF32(3)); // -(2*3)-1 = -7
 }
 
-test "fld/fsd - load and store double" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 104 } },
-        .{ .fld = .{ .rd = 0, .rs1 = 1, .imm = 0 } },
-        .{ .fsd = .{ .rs1 = 1, .rs2 = 0, .imm = 16 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-
-    const pi: f64 = 3.141592653589793;
-    try cpu.writeMemory(104, @as(u64, @bitCast(pi)));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(3));
-
-    const loaded = try cpu.readMemory(120, u64, .read);
-    try std.testing.expectEqual(@as(u64, @bitCast(pi)), loaded);
-}
-
-test "fadd_d - add doubles" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fadd_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 1.5);
-    cpu.registers.setF64(1, 2.5);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 4.0), cpu.registers.getF64(2));
-}
-
-test "fadd_d - inf + (-inf) produces NaN and sets NV" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fadd_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, std.math.inf(f64));
-    cpu.registers.setF64(1, -std.math.inf(f64));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isNan(cpu.registers.getF64(2)));
-    try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fsub_d - subtract doubles" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fsub_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 5.0);
-    cpu.registers.setF64(1, 2.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 3.0), cpu.registers.getF64(2));
-}
-
-test "fmul_d - multiply doubles" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fmul_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 3.0);
-    cpu.registers.setF64(1, 4.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 12.0), cpu.registers.getF64(2));
-}
-
-test "fmul_d - 0 * inf produces NaN and sets NV" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fmul_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 0.0);
-    cpu.registers.setF64(1, std.math.inf(f64));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isNan(cpu.registers.getF64(2)));
-    try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fdiv_d - divide doubles" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fdiv_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 10.0);
-    cpu.registers.setF64(1, 4.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 2.5), cpu.registers.getF64(2));
-}
-
-test "fdiv_d - division by zero sets DZ" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fdiv_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 1.0);
-    cpu.registers.setF64(1, 0.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isInf(cpu.registers.getF64(2)));
-    try std.testing.expect(cpu.registers.fcsr.dz);
-}
-
-test "fsqrt_d - square root" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fsqrt_d = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 16.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 4.0), cpu.registers.getF64(1));
-}
-
-test "fsqrt_d - negative produces NaN and sets NV" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fsqrt_d = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, -1.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isNan(cpu.registers.getF64(1)));
-    try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fmin_d - basic min" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fmin_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 3.0);
-    cpu.registers.setF64(1, 7.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 3.0), cpu.registers.getF64(2));
-}
-
-test "fmin_d - -0.0 is less than +0.0" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fmin_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 0.0);
-    cpu.registers.setF64(1, @bitCast(@as(u64, 0x8000000000000000))); // -0.0
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(u64, 0x8000000000000000), @as(u64, @bitCast(cpu.registers.getF64(2))));
-}
-
-test "fmax_d - basic max" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fmax_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 3.0);
-    cpu.registers.setF64(1, 7.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 7.0), cpu.registers.getF64(2));
-}
-
-test "fsgnj_d - sign injection" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fsgnj_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 5.0);
-    cpu.registers.setF64(1, -3.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, -5.0), cpu.registers.getF64(2));
-}
-
-test "fsgnjn_d - negated sign injection" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fsgnjn_d = .{ .rd = 2, .rs1 = 0, .rs2 = 1 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 5.0);
-    cpu.registers.setF64(1, -3.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 5.0), cpu.registers.getF64(2));
-}
-
-test "fsgnjx_d - xor sign (fabs idiom)" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fsgnjx_d = .{ .rd = 2, .rs1 = 0, .rs2 = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, -7.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 7.0), cpu.registers.getF64(2));
-}
-
-test "feq_d - equal doubles" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .feq_d = .{ .rd = 1, .rs1 = 0, .rs2 = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 3.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(i32, 1), cpu.registers.get(1));
-}
-
-test "feq_d - NaN never equals anything" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .feq_d = .{ .rd = 1, .rs1 = 0, .rs2 = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, std.math.nan(f64));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(i32, 0), cpu.registers.get(1));
-}
-
-test "flt_d - less than comparison" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .flt_d = .{ .rd = 1, .rs1 = 0, .rs2 = 2 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 2.0);
-    cpu.registers.setF64(2, 5.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(i32, 1), cpu.registers.get(1));
-}
-
-test "flt_d - NaN sets NV and returns 0" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .flt_d = .{ .rd = 1, .rs1 = 0, .rs2 = 2 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, std.math.nan(f64));
-    cpu.registers.setF64(2, 1.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(i32, 0), cpu.registers.get(1));
-    try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fle_d - less than or equal comparison" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fle_d = .{ .rd = 1, .rs1 = 0, .rs2 = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 2.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(i32, 1), cpu.registers.get(1));
-}
-
-test "fcvt_w_d - double to signed int" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_w_d = .{ .rd = 1, .rs1 = 0, .rm = 1 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, -1234567.89);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(i32, -1234567), cpu.registers.get(1));
-    try std.testing.expect(cpu.registers.fcsr.nx);
-}
-
-test "fcvt_w_d - overflow saturates and sets NV" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_w_d = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 1e20);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(std.math.maxInt(i32), cpu.registers.get(1));
-    try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fcvt_wu_d - double to unsigned int" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_wu_d = .{ .rd = 1, .rs1 = 0, .rm = 1 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 42.9);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(u32, 42), @as(u32, @bitCast(cpu.registers.get(1))));
-}
-
-test "fcvt_wu_d - negative produces zero and sets NV" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_wu_d = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, -5.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(cpu.registers.get(1))));
-    try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fcvt_d_w - signed int to double (exact)" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = -42 } },
-        .{ .fcvt_d_w = .{ .rd = 0, .rs1 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(2));
-    try std.testing.expectEqual(@as(f64, -42.0), cpu.registers.getF64(0));
-    try std.testing.expect(!cpu.registers.fcsr.nx); // Always exact for i32 -> f64
-}
-
-test "fcvt_d_wu - unsigned int to double (exact)" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_d_wu = .{ .rd = 0, .rs1 = 1, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.set(1, @bitCast(@as(u32, 0xFFFFFFFF)));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 4294967295.0), cpu.registers.getF64(0));
-    try std.testing.expect(!cpu.registers.fcsr.nx); // Always exact for u32 -> f64
-}
-
-test "fcvt_s_d - double to single" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_s_d = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 3.14159265358979323846);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectApproxEqRel(@as(f32, 3.14159265), cpu.registers.getF32(1), 1e-6);
-    try std.testing.expect(cpu.registers.fcsr.nx); // Loses precision
-}
-
-test "fcvt_s_d - NaN produces canonical NaN" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_s_d = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, std.math.nan(f64));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isNan(cpu.registers.getF32(1)));
-}
-
-test "fcvt_s_d - sNaN sets NV" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_s_d = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, @bitCast(@as(u64, 0x7FF0000000000001))); // sNaN
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fcvt_d_s - single to double" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_d_s = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF32(0, 3.14159);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, @as(f32, 3.14159)), cpu.registers.getF64(1));
-    try std.testing.expect(!cpu.registers.fcsr.nx); // f32 -> f64 is exact
-}
-
-test "fcvt_d_s - NaN produces canonical NaN" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_d_s = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF32(0, std.math.nan(f32));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isNan(cpu.registers.getF64(1)));
-}
-
-test "fclass_d - classify positive zero" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fclass_d = .{ .rd = 1, .rs1 = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 0.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(u32, 0x010), @as(u32, @bitCast(cpu.registers.get(1))));
-}
-
-test "fclass_d - classify positive infinity" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fclass_d = .{ .rd = 1, .rs1 = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, std.math.inf(f64));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(u32, 0x080), @as(u32, @bitCast(cpu.registers.get(1))));
-}
-
-test "fclass_d - classify quiet NaN" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fclass_d = .{ .rd = 1, .rs1 = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, std.math.nan(f64));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(u32, 0x200), @as(u32, @bitCast(cpu.registers.get(1))));
-}
-
-test "fmadd_d - fused multiply-add" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fmadd_d = .{ .rd = 3, .rs1 = 0, .rs2 = 1, .rs3 = 2, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 2.0);
-    cpu.registers.setF64(1, 3.0);
-    cpu.registers.setF64(2, 1.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 7.0), cpu.registers.getF64(3));
-}
-
-test "fmadd_d - inf * 0 produces NaN and sets NV" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fmadd_d = .{ .rd = 3, .rs1 = 0, .rs2 = 1, .rs3 = 2, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, std.math.inf(f64));
-    cpu.registers.setF64(1, 0.0);
-    cpu.registers.setF64(2, 1.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isNan(cpu.registers.getF64(3)));
-    try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fmsub_d - fused multiply-subtract" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fmsub_d = .{ .rd = 3, .rs1 = 0, .rs2 = 1, .rs3 = 2, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 2.0);
-    cpu.registers.setF64(1, 3.0);
-    cpu.registers.setF64(2, 1.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, 5.0), cpu.registers.getF64(3));
-}
-
-test "fnmsub_d - negated fused multiply-subtract" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fnmsub_d = .{ .rd = 3, .rs1 = 0, .rs2 = 1, .rs3 = 2, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 2.0);
-    cpu.registers.setF64(1, 3.0);
-    cpu.registers.setF64(2, 1.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, -5.0), cpu.registers.getF64(3)); // -(2*3)+1
-}
-
-test "fnmadd_d - negated fused multiply-add" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fnmadd_d = .{ .rd = 3, .rs1 = 0, .rs2 = 1, .rs3 = 2, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, 2.0);
-    cpu.registers.setF64(1, 3.0);
-    cpu.registers.setF64(2, 1.0);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(f64, -7.0), cpu.registers.getF64(3)); // -(2*3)-1
-}
-
 test "fcvt_w_s - rounding mode RDN (round down)" {
     var ram = initRamWithCode(1024, &.{
         .{ .fcvt_w_s = .{ .rd = 1, .rs1 = 0, .rm = 2 } }, // RDN
@@ -7097,36 +5487,6 @@ test "sw - misaligned address produces trap" {
     try std.testing.expectEqual(@as(u32, 102), state.trap.tval);
 }
 
-test "fld - misaligned address produces trap" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fld = .{ .rd = 0, .rs1 = 1, .imm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.set(1, 100); // Not 8-byte aligned
-
-    const state = cpu.step();
-
-    try std.testing.expect(state == .trap);
-    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_address_misaligned, state.trap.cause.exception);
-    try std.testing.expectEqual(@as(u32, 100), state.trap.tval);
-}
-
-test "fsd - misaligned address produces trap" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fsd = .{ .rs1 = 1, .rs2 = 0, .imm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.set(1, 100); // Not 8-byte aligned
-
-    const state = cpu.step();
-
-    try std.testing.expect(state == .trap);
-    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_address_misaligned, state.trap.cause.exception);
-    try std.testing.expectEqual(@as(u32, 100), state.trap.tval);
-}
-
 test "NaN-boxing - reading non-boxed f32 returns NaN" {
     var ram = initRamWithCode(1024, &.{
         .{ .fadd_s = .{ .rd = 1, .rs1 = 0, .rs2 = 0, .rm = 0 } },
@@ -7192,20 +5552,6 @@ test "fcvt_wu_s - small negative rounds to negative with RDN sets NV" {
     // floor(-0.1) = -1, which is negative -> invalid
     try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(cpu.registers.get(1))));
     try std.testing.expect(cpu.registers.fcsr.nv);
-}
-
-test "fcvt_wu_d - small negative rounds to zero without NV (RTZ)" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_wu_d = .{ .rd = 1, .rs1 = 0, .rm = 1 } }, // RTZ
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, -0.999);
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(cpu.registers.get(1))));
-    try std.testing.expect(cpu.registers.fcsr.nx);
-    try std.testing.expect(!cpu.registers.fcsr.nv);
 }
 
 test "fadd_s - adding opposite infinities of same sign" {
@@ -7534,32 +5880,6 @@ test "mulhsu - positive signed times max unsigned" {
     try std.testing.expectEqual(@as(i32, 1), cpu.registers.get(3));
 }
 
-test "fcvt_d_s - preserves infinity sign" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_d_s = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF32(0, -std.math.inf(f32));
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isNegativeInf(cpu.registers.getF64(1)));
-}
-
-test "fcvt_s_d - overflow to infinity sets OF and NX" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fcvt_s_d = .{ .rd = 1, .rs1 = 0, .rm = 0 } },
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.mstatus.fs = 0b01;
-    cpu.registers.setF64(0, std.math.floatMax(f64)); // Too large for f32
-
-    try std.testing.expectEqual(TestCpu.State.ok, cpu.run(1));
-    try std.testing.expect(std.math.isInf(cpu.registers.getF32(1)));
-    try std.testing.expect(cpu.registers.fcsr.of);
-    try std.testing.expect(cpu.registers.fcsr.nx);
-}
-
 test "feq_s - both operands qNaN does not set NV" {
     var ram = initRamWithCode(1024, &.{
         .{ .feq_s = .{ .rd = 1, .rs1 = 0, .rs2 = 2 } },
@@ -7822,19 +6142,23 @@ test "U-mode counter access allowed when mcounteren.cy is set" {
     try std.testing.expectEqual(@as(i32, 12345), cpu.registers.get(1));
 }
 
-test "ecall from U-mode - produces trap" {
+test "ecall from U-mode - triggers trap handling" {
     var ram = initRamWithCode(1024, &.{
         .ecall,
     });
-    var cpu: TestCpu = .init(&ram);
+    var cpu: TrapsTestCpu = .init(&ram);
     cpu.registers.privilege = .user;
     cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
     configurePmpFullAccess(&cpu);
 
     const state = cpu.step();
 
-    try std.testing.expect(state == .trap);
-    try std.testing.expectEqual(arch.Registers.Mcause.Exception.ecall_from_u, state.trap.cause.exception);
+    try std.testing.expectEqual(TrapsTestCpu.State.ok, state);
+    try std.testing.expectEqual(@as(u32, 0x100), cpu.registers.pc);
+    try std.testing.expectEqual(@as(u32, 0), cpu.registers.mepc);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.ecall_from_u, cpu.registers.mcause.toException());
+    try std.testing.expectEqual(arch.PrivilegeLevel.machine, cpu.registers.privilege);
+    try std.testing.expect(!cpu.registers.mstatus.mie);
 }
 
 test "ecall from M-mode - produces trap" {
@@ -8327,37 +6651,34 @@ test "trap handling and resume advances PC" {
         .ecall,
         .{ .addi = .{ .rd = 1, .rs1 = 0, .imm = 42 } },
     });
-    var cpu: TestCpu = .init(&ram);
+    var cpu: TrapsTestCpu = .init(&ram);
     cpu.registers.privilege = .user;
     cpu.registers.mtvec = .{ .base = 0x100 >> 2, .mode = .direct };
     configurePmpFullAccess(&cpu);
 
-    // Place mret at trap handler
+    const addi_mepc = (arch.Instruction{ .addi = .{ .rd = 0, .rs1 = 0, .imm = 0 } }).encode();
+    std.mem.writeInt(u32, ram[0x100..0x104], addi_mepc, arch.ENDIAN);
     const mret_encoded = (arch.Instruction{ .mret = {} }).encode();
-    std.mem.writeInt(u32, ram[0x100..0x104], mret_encoded, arch.ENDIAN);
+    std.mem.writeInt(u32, ram[0x104..0x108], mret_encoded, arch.ENDIAN);
 
     var state = cpu.step();
-    try std.testing.expect(state == .trap);
-    try std.testing.expectEqual(arch.Registers.Mcause.Exception.ecall_from_u, state.trap.cause.exception);
-
-    // Handle the trap
-    cpu.handleTrap(state.trap.cause, state.trap.tval);
+    try std.testing.expectEqual(TrapsTestCpu.State.ok, state);
     try std.testing.expectEqual(@as(u32, 0x100), cpu.registers.pc);
     try std.testing.expectEqual(@as(u32, 0), cpu.registers.mepc);
     try std.testing.expectEqual(arch.PrivilegeLevel.machine, cpu.registers.privilege);
 
-    // Simulate trap handler advancing mepc to skip ecall
     cpu.registers.mepc +%= 4;
 
-    // Execute mret
     state = cpu.step();
-    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(TrapsTestCpu.State.ok, state);
+
+    state = cpu.step();
+    try std.testing.expectEqual(TrapsTestCpu.State.ok, state);
     try std.testing.expectEqual(@as(u32, 4), cpu.registers.pc);
     try std.testing.expectEqual(arch.PrivilegeLevel.user, cpu.registers.privilege);
 
-    // Continue execution
     state = cpu.step();
-    try std.testing.expectEqual(TestCpu.State.ok, state);
+    try std.testing.expectEqual(TrapsTestCpu.State.ok, state);
     try std.testing.expectEqual(@as(i32, 42), cpu.registers.get(1));
 }
 
@@ -8675,84 +6996,6 @@ test "mie and mip bitcast sanity check" {
     try std.testing.expectEqual(@as(u32, 0x80), mie_val & mip_val);
 }
 
-test "PMP denies access crossing region boundary" {
-    // Test 1: Write u32 completely inside region - should succeed
-    var instr_ram = initRamWithCode(1024, &.{
-        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
-    });
-    var test_cpu: TestCpu = .init(&instr_ram);
-    test_cpu.registers.privilege = .user;
-    test_cpu.registers.set(1, 0x120); // Address inside data region
-    test_cpu.registers.set(2, 0x12345678);
-
-    // Configure PMP for DATA region: 0x100-0x200 (256 bytes), RW
-    test_cpu.registers.pmpaddr[0] = 0x5F; // NAPOT 0x100-0x200
-    test_cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
-        .r = true,
-        .w = true,
-        .x = false, // Data, not code
-        .a = .napot,
-    }));
-
-    // Configure PMP for CODE region - MUST be done for U-mode!
-    configurePmpForCode(&test_cpu);
-
-    try std.testing.expectEqual(TestCpu.State.ok, test_cpu.step());
-
-    // Test 2: Write u32 crossing END of region (0x1FE-0x202) - should fail
-    var instr_ram2 = initRamWithCode(1024, &.{
-        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
-    });
-    var test_cpu2: TestCpu = .init(&instr_ram2);
-    test_cpu2.registers.privilege = .user;
-    test_cpu2.registers.set(1, 0x1FE); // Crosses boundary: 0x1FE + 4 = 0x202 > 0x200
-    test_cpu2.registers.set(2, 0x12345678);
-
-    test_cpu2.registers.pmpaddr[0] = 0x5F;
-    test_cpu2.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
-        .r = true,
-        .w = true,
-        .x = false,
-        .a = .napot,
-    }));
-    configurePmpForCode(&test_cpu2);
-
-    const state2 = test_cpu2.step();
-    try std.testing.expect(state2 == .trap);
-    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state2.trap.cause.exception);
-    try std.testing.expectEqual(@as(u32, 0x1FE), state2.trap.tval);
-}
-
-test "PMP denies access crossing region START boundary" {
-    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.privilege = .user;
-
-    // Region: 0x100-0x200
-    cpu.registers.pmpaddr[0] = 0x5F; // NAPOT 0x100-0x200
-    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
-        .r = true,
-        .w = true,
-        .x = true,
-        .a = .napot,
-    }));
-
-    // Write u32 crossing START of region (0xFE-0x102) - should fail
-    cpu.registers.set(1, 0xFE);
-    cpu.registers.set(2, @truncate(0xDEADBEEF));
-
-    var instr_ram = initRamWithCode(1024, &.{
-        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
-    });
-    var test_cpu: TestCpu = .init(&instr_ram);
-    test_cpu.registers = cpu.registers;
-    configurePmpForCode(&test_cpu);
-
-    const state = test_cpu.step();
-    try std.testing.expect(state == .trap);
-    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state.trap.cause.exception);
-}
-
 test "PMP allows access fully within region" {
     var ram: [1024]u8 = std.mem.zeroes([1024]u8);
     var cpu: TestCpu = .init(&ram);
@@ -8841,59 +7084,6 @@ test "PMP TOR mode boundary crossing" {
     try std.testing.expect(result2);
 }
 
-test "PMP u64 load/store boundary check" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .fld = .{ .rd = 0, .rs1 = 1, .imm = 0 } }, // Load 8 bytes
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.privilege = .user;
-    cpu.registers.mstatus.fs = 0b01; // Enable FPU
-
-    // Region: 0x100-0x200
-    cpu.registers.pmpaddr[0] = 0x5F;
-    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
-        .r = true,
-        .w = true,
-        .x = true,
-        .a = .napot,
-    }));
-    configurePmpForCode(&cpu);
-
-    // fld from 0x1FC should fail (0x1FC + 8 = 0x204 > 0x200)
-    cpu.registers.set(1, 0x1FC);
-
-    const state = cpu.step();
-    try std.testing.expect(state == .trap);
-    try std.testing.expectEqual(arch.Registers.Mcause.Exception.load_access_fault, state.trap.cause.exception);
-    try std.testing.expectEqual(@as(u32, 0x1FC), state.trap.tval);
-}
-
-test "PMP u16 store boundary check" {
-    var ram = initRamWithCode(1024, &.{
-        .{ .sh = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } }, // Store 2 bytes
-    });
-    var cpu: TestCpu = .init(&ram);
-    cpu.registers.privilege = .user;
-
-    // Region: 0x100-0x200
-    cpu.registers.pmpaddr[0] = 0x5F;
-    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
-        .r = true,
-        .w = true,
-        .x = true,
-        .a = .napot,
-    }));
-    configurePmpForCode(&cpu);
-
-    // sh to 0x1FF should fail (0x1FF + 2 = 0x201 > 0x200)
-    cpu.registers.set(1, 0x1FF);
-    cpu.registers.set(2, 0x1234);
-
-    const state = cpu.step();
-    try std.testing.expect(state == .trap);
-    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state.trap.cause.exception);
-}
-
 test "PMP multiple regions - access must be in single region" {
     var ram: [1024]u8 = std.mem.zeroes([1024]u8);
     var cpu: TestCpu = .init(&ram);
@@ -8939,14 +7129,116 @@ fn configurePmpForCode(cpu: *TestCpu) void {
 
     const cfg = arch.Registers.PmpCfg{
         .r = true,
-        .w = true,
-        .x = true, // Execute permission!
+        .w = false,
+        .x = true,
         .a = .napot,
     };
 
     // Entry 15 is in pmpcfg[3], byte 3
     cpu.registers.pmpcfg[3] = (cpu.registers.pmpcfg[3] & 0x00FFFFFF) |
         (@as(u32, @as(u8, @bitCast(cfg))) << 24);
+}
+
+test "PMP denies access past region end" {
+    // Test 1: Write u32 completely inside region - should succeed
+    var instr_ram = initRamWithCode(1024, &.{
+        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
+    });
+    var test_cpu: TestCpu = .init(&instr_ram);
+    test_cpu.registers.privilege = .user;
+    test_cpu.registers.set(1, 0x120);
+    test_cpu.registers.set(2, 0x12345678);
+
+    test_cpu.registers.pmpaddr[0] = 0x5F; // NAPOT 0x100-0x200
+    test_cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = false,
+        .a = .napot,
+    }));
+    configurePmpForCode(&test_cpu);
+
+    try std.testing.expectEqual(TestCpu.State.ok, test_cpu.step());
+
+    // Test 2: Write u32 just past region end (0x200, 4-byte aligned) - should fail
+    var instr_ram2 = initRamWithCode(1024, &.{
+        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
+    });
+    var test_cpu2: TestCpu = .init(&instr_ram2);
+    test_cpu2.registers.privilege = .user;
+    test_cpu2.registers.set(1, 0x200); // Just past region, aligned
+    test_cpu2.registers.set(2, 0x12345678);
+
+    test_cpu2.registers.pmpaddr[0] = 0x5F;
+    test_cpu2.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = false,
+        .a = .napot,
+    }));
+    configurePmpForCode(&test_cpu2);
+
+    const state2 = test_cpu2.step();
+    try std.testing.expect(state2 == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state2.trap.cause.exception);
+    try std.testing.expectEqual(@as(u32, 0x200), state2.trap.tval);
+}
+
+test "PMP denies access before region start" {
+    var ram: [1024]u8 = std.mem.zeroes([1024]u8);
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // Region: 0x100-0x200
+    cpu.registers.pmpaddr[0] = 0x5F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+
+    // Write u32 before region (0xFC, 4-byte aligned) - should fail
+    cpu.registers.set(1, 0xFC);
+    cpu.registers.set(2, @truncate(0xDEADBEEF));
+
+    var instr_ram = initRamWithCode(1024, &.{
+        .{ .sw = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
+    });
+    var test_cpu: TestCpu = .init(&instr_ram);
+    test_cpu.registers = cpu.registers;
+    configurePmpForCode(&test_cpu);
+
+    const state = test_cpu.step();
+
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state.trap.cause.exception);
+}
+
+test "PMP u16 store outside region" {
+    var ram = initRamWithCode(1024, &.{
+        .{ .sh = .{ .rs1 = 1, .rs2 = 2, .imm = 0 } },
+    });
+    var cpu: TestCpu = .init(&ram);
+    cpu.registers.privilege = .user;
+
+    // Region: 0x100-0x200
+    cpu.registers.pmpaddr[0] = 0x5F;
+    cpu.registers.pmpcfg[0] = @as(u8, @bitCast(arch.Registers.PmpCfg{
+        .r = true,
+        .w = true,
+        .x = true,
+        .a = .napot,
+    }));
+    configurePmpForCode(&cpu);
+
+    // sh to 0x200 (2-byte aligned, outside region) - should fail
+    cpu.registers.set(1, 0x200);
+    cpu.registers.set(2, 0x1234);
+
+    const state = cpu.step();
+    try std.testing.expect(state == .trap);
+    try std.testing.expectEqual(arch.Registers.Mcause.Exception.store_access_fault, state.trap.cause.exception);
 }
 
 test "wfi halts without advancing PC when no interrupt pending" {

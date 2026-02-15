@@ -5,6 +5,8 @@ const std = @import("std");
 
 const ondatra = @import("ondatra");
 
+const RAM_SIZE = std.math.pow(usize, 2, 14);
+
 const Runner = struct {
     const State = enum {
         idle,
@@ -256,46 +258,109 @@ pub fn main() !void {
     defer _ = alloc.deinit();
 
     const benchs = [_]Benchmark{
-        .{ .name = "fibbonacci_compilant", .func = fibbonacciCompilantBenchmark },
+        .{ .name = "fibbonacci_compliant", .func = fibbonacciCompliantBenchmark },
         .{ .name = "fibbonacci_fast", .func = fibbonacciFastBenchmark },
-        .{ .name = "floatMinMaxAbs_compilant", .func = floatMinMaxAbsCompilantBenchmark },
+        .{ .name = "floatMinMaxAbs_compliant", .func = floatMinMaxAbsCompliantBenchmark },
         .{ .name = "floatMinMaxAbs_fast", .func = floatMinMaxAbsFastBenchmark },
-        .{ .name = "floatArithmetic_compilant", .func = floatArithmeticCompilantBenchmark },
+        .{ .name = "floatArithmetic_compliant", .func = floatArithmeticCompliantBenchmark },
         .{ .name = "floatArithmetic_fast", .func = floatArithmeticFastBenchmark },
-        .{ .name = "floatSqrtFma_compilant", .func = floatSqrtFmaCompilantBenchmark },
+        .{ .name = "floatSqrtFma_compliant", .func = floatSqrtFmaCompliantBenchmark },
         .{ .name = "floatSqrtFma_fast", .func = floatSqrtFmaFastBenchmark },
     };
+
     var runner: Runner = .init();
 
     for (benchs) |bench| {
         try runner.run(alloc.allocator(), bench);
     }
+    // foobar(alloc.allocator());
 }
 
-/// Like `.fast` but with enabled counters of course!
-const FAST: ondatra.cpu.Config.Runtime = .{
-    .enable_pmp = false,
-    .enable_pmp_m = false,
-    .enable_memory_alignment = false,
-    .enable_privilege = false,
-    .enable_csr_checks = false,
-    .enable_interrupts = false,
-    .enable_branch_alignment = false,
-    .enable_fpu_flags = false,
-    .timer_ticks_per_step = 0,
-};
+fn foobar(allocator: std.mem.Allocator) void {
+    const PROGRAM = @embedFile("float_sqrt_fma.bin");
 
-const fibbonacciCompilantBenchmark = MakeBenchmark("fibbonacci.bin", .compliant);
-const fibbonacciFastBenchmark = MakeBenchmark("fibbonacci.bin", FAST);
+    const State = struct {
+        const Cpu = ondatra.jit.Cpu(.{
+            .hooks = .{
+                .ecall = ecall,
+            },
+            .runtime = .compliant,
+        });
 
-const floatMinMaxAbsCompilantBenchmark = MakeBenchmark("float_minmax_abs.bin", .compliant);
-const floatMinMaxAbsFastBenchmark = MakeBenchmark("float_minmax_abs.bin", FAST);
+        cpu: Cpu,
 
-const floatArithmeticCompilantBenchmark = MakeBenchmark("float_arithmetic.bin", .compliant);
-const floatArithmeticFastBenchmark = MakeBenchmark("float_arithmetic.bin", FAST);
+        fn ecall(ctx: *anyopaque, cause: ondatra.arch.Registers.Mcause.Exception) callconv(.c) ondatra.jit.EngineConfig.Hooks.Action {
+            _ = cause;
 
-const floatSqrtFmaCompilantBenchmark = MakeBenchmark("float_sqrt_fma.bin", .compliant);
-const floatSqrtFmaFastBenchmark = MakeBenchmark("float_sqrt_fma.bin", FAST);
+            const cpu: *Cpu = @ptrCast(@alignCast(ctx));
+
+            const syscall_num = cpu.registers.common[17]; // a7
+            const arg0 = cpu.registers.common[10]; // a0
+
+            std.debug.print("syscall: {}, arg0: {}\n", .{ syscall_num, arg0 });
+
+            return .halt;
+        }
+    };
+
+    var ram = std.mem.zeroes([std.math.pow(usize, 2, 12)]u8);
+    var state: State = .{
+        .cpu = State.Cpu.init(allocator, &ram) catch |err| {
+            std.debug.print("failed to initialize the CPU: {t}\n", .{err});
+
+            return;
+        },
+    };
+
+    state.cpu.registers.mstatus.fs = 0b01;
+    _ = state.cpu.loadElf(allocator, PROGRAM, 0) catch |err| {
+        std.debug.print("failed to load the program: {t}\n", .{err});
+
+        return;
+    };
+
+    std.mem.doNotOptimizeAway(&state);
+    std.mem.doNotOptimizeAway(&state.cpu);
+    std.mem.doNotOptimizeAway(&ram);
+
+    const step_state = state.cpu.run(std.math.maxInt(u64)) catch |err| {
+        std.debug.print("failed to step the CPU: {t}\n", .{err});
+
+        return;
+    };
+
+    std.mem.doNotOptimizeAway(&step_state);
+
+    switch (step_state) {
+        .ok => {
+            std.debug.print("over\n", .{});
+
+            return;
+        },
+        .trap => {
+            std.debug.print("unexpected trap\n", .{});
+
+            return;
+        },
+        .halt => {
+            std.debug.print("unexpected halt\n", .{});
+
+            return;
+        },
+    }
+}
+
+const fibbonacciCompliantBenchmark = MakeBenchmark("fibbonacci.bin", .compliant);
+const fibbonacciFastBenchmark = MakeBenchmark("fibbonacci.bin", .fast);
+
+const floatMinMaxAbsCompliantBenchmark = MakeBenchmark("float_minmax_abs.bin", .compliant);
+const floatMinMaxAbsFastBenchmark = MakeBenchmark("float_minmax_abs.bin", .fast);
+
+const floatArithmeticCompliantBenchmark = MakeBenchmark("float_arithmetic.bin", .compliant);
+const floatArithmeticFastBenchmark = MakeBenchmark("float_arithmetic.bin", .fast);
+
+const floatSqrtFmaCompliantBenchmark = MakeBenchmark("float_sqrt_fma.bin", .compliant);
+const floatSqrtFmaFastBenchmark = MakeBenchmark("float_sqrt_fma.bin", .fast);
 
 fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Config.Runtime) Benchmark.Func {
     return struct {
@@ -322,17 +387,17 @@ fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Conf
 
                     state.over = true;
 
-                    return .skip;
+                    return .halt;
                 }
             };
 
-            var ram = std.mem.zeroes([std.math.pow(usize, 2, 12)]u8);
+            var ram = std.mem.zeroes([RAM_SIZE]u8);
             var state: State = .{
                 .cpu = .init(&ram),
             };
 
             state.cpu.registers.mstatus.fs = 0b01;
-            _ = state.cpu.loadElf(allocator, PROGRAM, 0) catch |err| {
+            _ = state.cpu.loadElf(allocator, PROGRAM) catch |err| {
                 std.debug.print("failed to load the program: {t}\n", .{err});
 
                 return false;
@@ -343,12 +408,13 @@ fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Conf
             std.mem.doNotOptimizeAway(&ram);
 
             r.begin() catch unreachable;
+            defer r.end(state.cpu.registers.instret) catch unreachable;
 
             while (!state.over) {
-                const step_state = state.cpu.step();
-                std.mem.doNotOptimizeAway(&step_state);
+                const run_state = state.cpu.run(std.math.maxInt(u64));
+                std.mem.doNotOptimizeAway(&run_state);
 
-                switch (step_state) {
+                switch (run_state) {
                     .ok => continue,
                     .trap => |i| {
                         std.debug.print("unexpected trap: {any}\n", .{i.cause});
@@ -356,14 +422,16 @@ fn MakeBenchmark(comptime program: []const u8, comptime config: ondatra.cpu.Conf
                         return false;
                     },
                     .halt => {
+                        if (state.over) {
+                            return true;
+                        }
+
                         std.debug.print("unexpected halt\n", .{});
 
                         return false;
                     },
                 }
             }
-
-            r.end(state.cpu.registers.instret) catch unreachable;
 
             return true;
         }

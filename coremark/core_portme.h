@@ -40,7 +40,7 @@ typedef unsigned long long CORE_TICKS;
 #define COMPILER_VERSION "zig cc"
 #endif
 #ifndef COMPILER_FLAGS
-#define COMPILER_FLAGS "-Doptimize=ReleaseFast -march=rv32imfd_zicsr_zba_zbb -mabi=ilp32d -freestanding"
+#define COMPILER_FLAGS "-Doptimize=ReleaseFast -march=rv32imf_zicsr_zba_zbb -mabi=ilp32f -freestanding"
 #endif
 #ifndef MEM_LOCATION
 #define MEM_LOCATION "STACK"

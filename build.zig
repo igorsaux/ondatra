@@ -38,10 +38,10 @@ pub fn build(b: *std.Build) void {
         bench_cmd.addArgs(args);
     }
 
-    const coremark = b.addExecutable(.{
-        .name = "coremark",
+    const coremark_interptreter = b.addExecutable(.{
+        .name = "coremark_interpreter",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("coremark/main.zig"),
+            .root_source_file = b.path("coremark/interpreter.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -50,17 +50,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    addCoremarkGuest(b, coremark);
+    addCoremarkGuest(b, coremark_interptreter, "10000");
 
-    b.installArtifact(coremark);
+    b.installArtifact(coremark_interptreter);
 
-    const coremark_step = b.step("coremark", "Run the coremark benchmark");
+    const coremark_interpreter_step = b.step("coremark_interpreter", "Run the coremark benchmark");
 
-    const coremark_cmd = b.addRunArtifact(coremark);
-    coremark_step.dependOn(&coremark_cmd.step);
+    const coremark_interpreter_cmd = b.addRunArtifact(coremark_interptreter);
+    coremark_interpreter_step.dependOn(&coremark_interpreter_cmd.step);
 
     if (b.args) |args| {
-        coremark_cmd.addArgs(args);
+        coremark_interpreter_cmd.addArgs(args);
     }
 
     const mod_tests = b.addTest(.{
@@ -83,7 +83,6 @@ const riscv32Query: std.Target.Query = .{
         std.Target.riscv.Feature.i,
         std.Target.riscv.Feature.m,
         std.Target.riscv.Feature.f,
-        std.Target.riscv.Feature.d,
         std.Target.riscv.Feature.zicsr,
         std.Target.riscv.Feature.zicntr,
         std.Target.riscv.Feature.zifencei,
@@ -113,7 +112,7 @@ fn addBinary(b: *std.Build, step: *std.Build.Step.Compile, path: std.Build.LazyP
     });
 }
 
-fn addCoremarkGuest(b: *std.Build, step: *std.Build.Step.Compile) void {
+fn addCoremarkGuest(b: *std.Build, step: *std.Build.Step.Compile, iterations: []const u8) void {
     const target = b.resolveTargetQuery(riscv32Query);
 
     const binary = b.addExecutable(.{
@@ -135,6 +134,7 @@ fn addCoremarkGuest(b: *std.Build, step: *std.Build.Step.Compile) void {
         },
         .language = .c,
     });
+    binary.root_module.addCMacro("ITERATIONS", iterations);
     binary.linker_script = b.path("coremark/link.ld");
 
     step.root_module.addAnonymousImport("coremark_guest.bin", .{
