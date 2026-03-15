@@ -970,6 +970,90 @@ pub inline fn ecall() void {
     asm volatile ("ecall" ::: .{ .memory = true });
 }
 
+pub inline fn syscall0(number: usize) usize {
+    return asm volatile ("ecall"
+        : [ret] "={a0}" (-> usize),
+        : [number] "{a7}" (number),
+        : .{ .memory = true });
+}
+
+pub inline fn syscall1(number: usize, a0: usize) usize {
+    return asm volatile ("ecall"
+        : [ret] "={a0}" (-> usize),
+        : [number] "{a7}" (number),
+          [arg0] "{a0}" (a0),
+        : .{ .memory = true });
+}
+
+pub inline fn syscall2(number: usize, a0: usize, a1: usize) usize {
+    return asm volatile ("ecall"
+        : [ret] "={a0}" (-> usize),
+        : [number] "{a7}" (number),
+          [arg0] "{a0}" (a0),
+          [arg1] "{a1}" (a1),
+        : .{ .memory = true });
+}
+
+pub inline fn syscall3(number: usize, a0: usize, a1: usize, a2: usize) usize {
+    return asm volatile ("ecall"
+        : [ret] "={a0}" (-> usize),
+        : [number] "{a7}" (number),
+          [arg0] "{a0}" (a0),
+          [arg1] "{a1}" (a1),
+          [arg2] "{a2}" (a2),
+        : .{ .memory = true });
+}
+
+pub inline fn syscall4(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) usize {
+    return asm volatile ("ecall"
+        : [ret] "={a0}" (-> usize),
+        : [number] "{a7}" (number),
+          [arg0] "{a0}" (a0),
+          [arg1] "{a1}" (a1),
+          [arg2] "{a2}" (a2),
+          [arg3] "{a3}" (a3),
+        : .{ .memory = true });
+}
+
+pub inline fn syscall5(number: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize) usize {
+    return asm volatile ("ecall"
+        : [ret] "={a0}" (-> usize),
+        : [number] "{a7}" (number),
+          [arg0] "{a0}" (a0),
+          [arg1] "{a1}" (a1),
+          [arg2] "{a2}" (a2),
+          [arg3] "{a3}" (a3),
+          [arg4] "{a4}" (a4),
+        : .{ .memory = true });
+}
+
+pub inline fn syscall6(number: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) usize {
+    return asm volatile ("ecall"
+        : [ret] "={a0}" (-> usize),
+        : [number] "{a7}" (number),
+          [arg0] "{a0}" (a0),
+          [arg1] "{a1}" (a1),
+          [arg2] "{a2}" (a2),
+          [arg3] "{a3}" (a3),
+          [arg4] "{a4}" (a4),
+          [arg5] "{a5}" (a5),
+        : .{ .memory = true });
+}
+
+pub inline fn syscall7(number: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) usize {
+    return asm volatile ("ecall"
+        : [ret] "={a0}" (-> usize),
+        : [number] "{a7}" (number),
+          [arg0] "{a0}" (a0),
+          [arg1] "{a1}" (a1),
+          [arg2] "{a2}" (a2),
+          [arg3] "{a3}" (a3),
+          [arg4] "{a4}" (a4),
+          [arg5] "{a5}" (a5),
+          [arg6] "{a6}" (a6),
+        : .{ .memory = true });
+}
+
 pub inline fn ebreak() void {
     asm volatile ("ebreak" ::: .{ .memory = true });
 }
