@@ -1260,7 +1260,7 @@ pub const Instruction = union(enum) {
 
     inline fn toRegisterChecked(from: u32) error{BadRegister}!u8 {
         if (from >= Registers.COMMON_REGISTERS) {
-            return DecodeError.BadRegister;
+            return error.BadRegister;
         }
 
         return @as(u8, @truncate(from));

@@ -126,15 +126,18 @@ const Runner = struct {
 
     pub const Error = error{ BenchmarkFailed, AlreadyRunning, NotRunning, EndWithoutBegin, OutOfMemory };
 
+    io: std.Io,
     state: State = .idle,
     recordings: ?Recordings = null,
 
-    pub inline fn init() Runner {
-        return .{};
+    pub inline fn init(io: std.Io) Runner {
+        return .{
+            .io = io,
+        };
     }
 
     pub inline fn begin(this: *Runner) Error!void {
-        const timestamp = std.time.nanoTimestamp();
+        const timestamp = std.Io.Timestamp.now(this.io, .real).toNanoseconds();
 
         switch (this.state) {
             .idle => return Error.NotRunning,
@@ -150,7 +153,7 @@ const Runner = struct {
     }
 
     pub inline fn end(this: *Runner, instructions: usize) Error!void {
-        const timestamp = std.time.nanoTimestamp();
+        const timestamp = std.Io.Timestamp.now(this.io, .real).toNanoseconds();
 
         switch (this.state) {
             .idle => return Error.NotRunning,
@@ -223,17 +226,31 @@ const Runner = struct {
         std.debug.print("|{s:-^10}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^12}|{s:-^10}|{s:-^10}|{s:-^10}|\n", .{
             "", "", "", "", "", "", "", "", "",
         });
-        std.debug.print("|{d: ^10}|{D: ^12}|{D: ^12}|{D: ^12}|{D: ^12}|{d: ^12.2}|{d: ^10.1}|{d: ^10.1}|{d: ^10.1}|\n", .{
-            stats.instructions,
-            @as(i64, @truncate(stats.min)),
-            @as(i64, @truncate(stats.max)),
-            @as(i64, @intFromFloat(stats.avg)),
-            @as(i64, @truncate(stats.median)),
+
+        const formatNanoseconds = struct {
+            pub fn formatNanoseconds(x: i96) void {
+                var buffer: [64]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&buffer);
+
+                writer.print("{f}", .{std.Io.Duration.fromNanoseconds(x)}) catch {};
+                writer.flush() catch {};
+
+                std.debug.print("|{s: ^12}", .{buffer[0..writer.end]});
+            }
+        }.formatNanoseconds;
+
+        std.debug.print("|{d: ^10}", .{stats.instructions});
+        formatNanoseconds(@truncate(stats.min));
+        formatNanoseconds(@truncate(stats.max));
+        formatNanoseconds(@intFromFloat(stats.avg));
+        formatNanoseconds(@truncate(stats.median));
+        std.debug.print("|{d: ^12.2}|{d: ^10.1}|{d: ^10.1}|{d: ^10.1}|\n", .{
             stats.std_dev / 1000.0,
             stats.mips(),
             stats.mipsFromTime(stats.max),
             stats.mipsFromTime(stats.min),
         });
+
         std.debug.print("+{s:-^108}+\n\n", .{"-"});
     }
 };
@@ -253,10 +270,7 @@ const Benchmark = struct {
     func: *const Func,
 };
 
-pub fn main() !void {
-    var alloc: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = alloc.deinit();
-
+pub fn main(init: std.process.Init) !void {
     const benchs = [_]Benchmark{
         .{ .name = "fibbonacci_compliant", .func = fibbonacciCompliantBenchmark },
         .{ .name = "fibbonacci_fast", .func = fibbonacciFastBenchmark },
@@ -268,12 +282,11 @@ pub fn main() !void {
         .{ .name = "floatSqrtFma_fast", .func = floatSqrtFmaFastBenchmark },
     };
 
-    var runner: Runner = .init();
+    var runner: Runner = .init(init.io);
 
     for (benchs) |bench| {
-        try runner.run(alloc.allocator(), bench);
+        try runner.run(init.gpa, bench);
     }
-    // foobar(alloc.allocator());
 }
 
 fn foobar(allocator: std.mem.Allocator) void {

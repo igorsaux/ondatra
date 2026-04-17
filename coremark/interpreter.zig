@@ -23,16 +23,18 @@ const Host = struct {
         },
     });
 
+    io: std.Io,
     cpu: Cpu,
-    stderr_writer: std.fs.File.Writer,
+    stderr_writer: std.Io.File.Writer,
     start_timestamp: i128,
 
-    pub fn init(allocator: std.mem.Allocator) !Host {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Host {
         const ram: []u8 = try allocator.alloc(u8, std.math.pow(usize, 2, 24));
         const cpu: Cpu = .init(ram);
-        const writer = std.fs.File.stderr().writer(&STDERR_BUFFER);
+        const writer = std.Io.File.stderr().writer(io, &STDERR_BUFFER);
 
         return .{
+            .io = io,
             .cpu = cpu,
             .stderr_writer = writer,
             .start_timestamp = 0,
@@ -71,7 +73,7 @@ const Host = struct {
                 return .skip;
             },
             SYS_GET_TIME => {
-                const now = std.time.nanoTimestamp();
+                const now = std.Io.Timestamp.now(this.io, .real).toNanoseconds();
                 const elapsed_ns: i64 = @intCast(now - this.start_timestamp);
 
                 cpu.registers.common[10] = @truncate(elapsed_ns); // a0 = lo
@@ -88,18 +90,15 @@ const Host = struct {
     }
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const COREMARK_GUEST = @embedFile("coremark_guest.bin");
 
-    var alloc: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = alloc.deinit();
+    var host: Host = try .init(init.gpa, init.io);
+    defer host.deinit(init.gpa);
 
-    var host: Host = try .init(alloc.allocator());
-    defer host.deinit(alloc.allocator());
+    _ = try host.cpu.loadElf(init.gpa, COREMARK_GUEST);
 
-    _ = try host.cpu.loadElf(alloc.allocator(), COREMARK_GUEST);
-
-    const start_time = std.time.nanoTimestamp();
+    const start_time = std.Io.Timestamp.now(init.io, .real).toNanoseconds();
     host.start_timestamp = start_time;
 
     run: while (true) {
